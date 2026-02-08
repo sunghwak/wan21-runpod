@@ -1,5 +1,5 @@
-# RunPod Serverless용 Docker 이미지 (초경량)
-# python:3.11-slim 기반 - torch wheel에 CUDA 런타임 포함
+# RunPod Serverless용 Docker 이미지
+# GitHub Actions에서 빌드 → GHCR에 푸시 → RunPod에서 pull
 
 FROM python:3.11-slim
 
@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CUDA 12.1 런타임 포함된 wheel)
+# PyTorch CPU+CUDA 12.1 런타임 (torchvision/torchaudio 제외로 ~1.5GB 절약)
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu121
 
