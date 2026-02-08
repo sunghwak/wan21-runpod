@@ -1,19 +1,16 @@
-# RunPod Serverless용 Docker 이미지 (최적화)
-# Wan 2.1 I2V 14B 720P 모델 - 경량 베이스 이미지 사용
+# RunPod Serverless용 Docker 이미지 (초경량)
+# python:3.11-slim 기반 - torch wheel에 CUDA 런타임 포함
 
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Python 및 시스템 패키지
+# ffmpeg만 설치 (비디오 인코딩용)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip ffmpeg \
-    && ln -sf /usr/bin/python3.10 /usr/bin/python \
-    && pip install --no-cache-dir --upgrade pip \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CUDA 12.1 - 경량 wheel)
+# PyTorch (CUDA 12.1 런타임 포함된 wheel)
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu121
 
