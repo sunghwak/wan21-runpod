@@ -1,30 +1,34 @@
-# RunPod Serverless용 Docker 이미지
-# Wan 2.1 I2V 14B 720P 모델 (고화질 클라우드 전용)
+# RunPod Serverless용 Docker 이미지 (최적화)
+# Wan 2.1 I2V 14B 720P 모델 - 경량 베이스 이미지 사용
 
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
-# 시스템 패키지
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# Python 및 시스템 패키지
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget ffmpeg \
+    python3.10 python3-pip ffmpeg \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && pip install --no-cache-dir --upgrade pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 패키지 설치
+# PyTorch (CUDA 12.1 - 경량 wheel)
 RUN pip install --no-cache-dir \
-    diffusers>=0.36.0 \
-    transformers>=4.44.0 \
-    accelerate>=0.34.0 \
+    torch --index-url https://download.pytorch.org/whl/cu121
+
+# AI/ML 패키지
+RUN pip install --no-cache-dir \
+    diffusers \
+    transformers \
+    accelerate \
     sentencepiece \
+    protobuf \
     imageio[ffmpeg] \
     Pillow \
-    runpod \
-    protobuf
+    runpod
 
 # 핸들러 복사
 COPY runpod_handler.py /handler.py
 
-# 모델을 미리 다운로드 (이미지 크기 커지지만 Cold Start 빠름)
-# 주석 해제하면 빌드 시 모델 포함 (~30GB 이미지)
-# RUN python -c "from diffusers import WanImageToVideoPipeline; WanImageToVideoPipeline.from_pretrained('Wan-AI/Wan2.1-I2V-14B-720P-Diffusers', torch_dtype='auto')"
-
-# 핸들러 실행
 CMD ["python", "/handler.py"]
