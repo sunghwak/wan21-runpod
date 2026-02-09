@@ -35,6 +35,43 @@ SUPPORTED_RESOLUTIONS = {
 }
 
 
+def validate_cache(cache_dir: str, model_id: str):
+    """캐시된 모델 파일이 손상되지 않았는지 검증, 손상 시 삭제"""
+    import json
+    import shutil
+    
+    model_cache = os.path.join(cache_dir, f"models--{model_id.replace('/', '--')}")
+    if not os.path.exists(model_cache):
+        logger.info("캐시 없음 - 새로 다운로드합니다")
+        return
+    
+    # 주요 JSON 설정 파일들 검증
+    corrupted = False
+    for root, dirs, files in os.walk(model_cache):
+        for fname in files:
+            if fname.endswith(".json"):
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r") as f:
+                        content = f.read().strip()
+                        if not content:
+                            raise ValueError("빈 파일")
+                        json.loads(content)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"손상된 파일 발견: {fpath} ({e})")
+                    corrupted = True
+                    break
+        if corrupted:
+            break
+    
+    if corrupted:
+        logger.warning(f"손상된 캐시 삭제 중: {model_cache}")
+        shutil.rmtree(model_cache, ignore_errors=True)
+        logger.info("캐시 삭제 완료 - 새로 다운로드합니다")
+    else:
+        logger.info("캐시 검증 OK")
+
+
 def load_model():
     """모델을 GPU에 로드 (80GB A100 - 720P 모델)"""
     global pipe
@@ -46,6 +83,9 @@ def load_model():
     # Network Volume에 모델 캐시 (/runpod-volume 마운트됨)
     cache_dir = "/runpod-volume/huggingface"
     os.makedirs(cache_dir, exist_ok=True)
+
+    # 손상된 캐시 파일 자동 정리
+    validate_cache(cache_dir, MODEL_ID)
 
     logger.info(f"모델 로딩 시작: {MODEL_ID} (캐시: {cache_dir})")
     start = time.time()
