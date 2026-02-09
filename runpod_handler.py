@@ -36,19 +36,24 @@ SUPPORTED_RESOLUTIONS = {
 
 
 def load_model():
-    """모델을 GPU에 로드 (RunPod GPU 48GB+ VRAM - 720P 모델)"""
+    """모델을 GPU에 로드 (80GB A100 - 720P 모델)"""
     global pipe
     if pipe is not None:
         return
 
     from diffusers import WanImageToVideoPipeline
 
-    logger.info(f"모델 로딩 시작: {MODEL_ID}")
+    # Network Volume에 모델 캐시 (/runpod-volume 마운트됨)
+    cache_dir = "/runpod-volume/huggingface"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    logger.info(f"모델 로딩 시작: {MODEL_ID} (캐시: {cache_dir})")
     start = time.time()
 
     pipe = WanImageToVideoPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
+        cache_dir=cache_dir,
     )
     # 80GB GPU - 전체 모델을 GPU에 로드 (최대 성능)
     pipe.to("cuda")
