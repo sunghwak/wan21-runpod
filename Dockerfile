@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir \
     accelerate \
     sentencepiece \
     protobuf \
+    ftfy \
     imageio[ffmpeg] \
     Pillow \
     runpod
