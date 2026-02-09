@@ -50,9 +50,8 @@ def load_model():
         MODEL_ID,
         torch_dtype=torch.float16,
     )
-    # CPU offload: 필요한 컴포넌트만 GPU로 올리고 나머지는 CPU에 대기
-    # 14B 모델이 ~44GB라 48GB GPU에서도 전체 로드 불가
-    pipe.enable_model_cpu_offload()
+    # 80GB GPU - 전체 모델을 GPU에 로드 (최대 성능)
+    pipe.to("cuda")
     pipe.enable_vae_slicing()
 
     elapsed = time.time() - start
