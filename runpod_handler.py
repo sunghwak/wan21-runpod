@@ -52,7 +52,6 @@ def load_model():
     )
     # 80GB GPU - 전체 모델을 GPU에 로드 (최대 성능)
     pipe.to("cuda")
-    pipe.enable_vae_slicing()
 
     elapsed = time.time() - start
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
