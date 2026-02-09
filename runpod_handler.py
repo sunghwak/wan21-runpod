@@ -50,8 +50,9 @@ def load_model():
         MODEL_ID,
         torch_dtype=torch.float16,
     )
-    # RunPod은 충분한 VRAM이 있으므로 전체 GPU 로드
-    pipe.to("cuda")
+    # CPU offload: 필요한 컴포넌트만 GPU로 올리고 나머지는 CPU에 대기
+    # 14B 모델이 ~44GB라 48GB GPU에서도 전체 로드 불가
+    pipe.enable_model_cpu_offload()
     pipe.enable_vae_slicing()
 
     elapsed = time.time() - start
