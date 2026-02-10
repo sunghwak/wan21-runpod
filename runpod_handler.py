@@ -295,11 +295,34 @@ def load_model():
     print(f"[Model] Ready for inference!")
 
 
+def detect_best_resolution(orig_w, orig_h):
+    """입력 이미지의 비율을 감지하여 가장 적합한 CogVideoX1.5 해상도 반환
+
+    CogVideoX1.5 규칙: Min(W,H)=768, 768<=Max(W,H)<=1360, Max(W,H)%16=0
+    """
+    aspect = orig_w / orig_h
+
+    # 각 지원 해상도와 비율 비교하여 가장 가까운 것 선택
+    best_match = None
+    best_diff = float("inf")
+
+    for name, (h, w) in SUPPORTED_RESOLUTIONS.items():
+        res_aspect = w / h
+        diff = abs(aspect - res_aspect)
+        if diff < best_diff:
+            best_diff = diff
+            best_match = (h, w, name)
+
+    h, w, name = best_match
+    print(f"[Resolution] Auto-detected: {name} ({w}x{h}) for input {orig_w}x{orig_h} (aspect={aspect:.2f})")
+    return h, w
+
+
 def prepare_image(image_b64, target_height=None, target_width=None):
     """base64 이미지를 PIL Image로 변환하고 지정 해상도로 리사이즈
 
     CogVideoX1.5-5B-I2V는 커스텀 해상도 지원.
-    기본값: 768x1360 (height x width)
+    target이 None이면 입력 이미지 비율에 맞는 최적 해상도 자동 선택.
     """
     # Decode base64
     image_bytes = base64.b64decode(image_b64)
@@ -308,16 +331,14 @@ def prepare_image(image_b64, target_height=None, target_width=None):
     orig_w, orig_h = image.size
     print(f"[Image] Original size: {orig_w}x{orig_h}")
 
-    # 목표 해상도 결정
-    if target_height is None:
-        target_height = DEFAULT_HEIGHT
-    if target_width is None:
-        target_width = DEFAULT_WIDTH
+    # 목표 해상도 결정 (auto 모드: 이미지 비율 기반 자동 선택)
+    if target_height is None or target_width is None:
+        target_height, target_width = detect_best_resolution(orig_w, orig_h)
 
     image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
     print(f"[Image] Resized to: {target_width}x{target_height}")
 
-    return image
+    return image, target_height, target_width
 
 
 def resolve_resolution(resolution_str):
@@ -413,10 +434,12 @@ def handler(job):
             print(f"[Frames] Adjusted to nearest valid value: {num_frames}")
 
         # 해상도 결정 (CogVideoX1.5는 커스텀 해상도 지원)
-        target_height, target_width = resolve_resolution(resolution)
-
-        # Prepare image
-        image = prepare_image(image_b64, target_height, target_width)
+        if resolution == "auto":
+            # auto 모드: prepare_image에서 이미지 비율 기반으로 자동 결정
+            image, target_height, target_width = prepare_image(image_b64)
+        else:
+            target_height, target_width = resolve_resolution(resolution)
+            image, target_height, target_width = prepare_image(image_b64, target_height, target_width)
 
         # Seed (공식: generator는 device 미지정 = CPU)
         if seed < 0:
