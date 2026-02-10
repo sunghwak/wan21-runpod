@@ -323,10 +323,15 @@ def prepare_image(image_b64, target_height=None, target_width=None):
 def resolve_resolution(resolution_str):
     """해상도 문자열을 (height, width) 튜플로 변환
 
+    CogVideoX1.5-5B-I2V 해상도 규칙 (공식 스펙):
+    - Min(W, H) = 768
+    - 768 <= Max(W, H) <= 1360
+    - Max(W, H) % 16 = 0
+
     지원 형식:
     - "auto" 또는 "16:9" → 기본 권장 해상도 (768x1360)
     - "9:16", "4:3", "3:4", "1:1" → SUPPORTED_RESOLUTIONS에서 조회
-    - "HxW" 형식 (예: "768x1360") → 직접 파싱
+    - "HxW" 형식 (예: "768x1360") → 직접 파싱 + 규칙 검증
     """
     if not resolution_str or resolution_str == "auto":
         return DEFAULT_HEIGHT, DEFAULT_WIDTH
@@ -340,9 +345,32 @@ def resolve_resolution(resolution_str):
         try:
             parts = resolution_str.lower().split("x")
             h, w = int(parts[0]), int(parts[1])
-            # 8의 배수로 정렬 (VAE 요구사항)
-            h = (h // 8) * 8
-            w = (w // 8) * 8
+
+            # CogVideoX1.5 해상도 규칙 적용
+            min_dim = min(h, w)
+            max_dim = max(h, w)
+
+            # Min dimension must be 768
+            if min_dim != 768:
+                ratio = 768 / min_dim
+                if h < w:
+                    h = 768
+                    w = int(w * ratio)
+                else:
+                    w = 768
+                    h = int(h * ratio)
+
+            # Max dimension: 768~1360, must be %16=0
+            max_dim = max(h, w)
+            max_dim = min(max(max_dim, 768), 1360)
+            max_dim = (max_dim // 16) * 16
+
+            if h >= w:
+                h = max_dim
+            else:
+                w = max_dim
+
+            print(f"[Resolution] Custom: {w}x{h} (validated)")
             return h, w
         except (ValueError, IndexError):
             pass
@@ -375,6 +403,14 @@ def handler(job):
         seed = int(job_input.get("seed", -1))
         fps = int(job_input.get("fps", 16))
         resolution = job_input.get("resolution", "auto")
+
+        # CogVideoX1.5 프레임 규칙: 16N+1 (N<=10)
+        # 유효값: 17, 33, 49, 65, 81, 97, 113, 129, 145, 161
+        valid_frames = [16 * n + 1 for n in range(1, 11)]
+        if num_frames not in valid_frames:
+            # 가장 가까운 유효값으로 보정
+            num_frames = min(valid_frames, key=lambda x: abs(x - num_frames))
+            print(f"[Frames] Adjusted to nearest valid value: {num_frames}")
 
         # 해상도 결정 (CogVideoX1.5는 커스텀 해상도 지원)
         target_height, target_width = resolve_resolution(resolution)
