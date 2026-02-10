@@ -40,7 +40,7 @@ gpu_name = "Unknown"
 
 
 def validate_cache(cache_dir, model_id):
-    """Network Volume에 캐시된 모델 파일의 무결성을 검증"""
+    """Network Volume에 캐시된 모델 파일의 무결성을 검증 (JSON + 바이너리)"""
     if not os.path.exists(cache_dir):
         print(f"[Cache] Cache directory does not exist: {cache_dir}")
         return
@@ -53,26 +53,37 @@ def validate_cache(cache_dir, model_id):
         return
 
     print(f"[Cache] Validating cache at: {model_cache_path}")
-    corrupted_files = []
+    corrupted = False
 
     for root, dirs, files in os.walk(model_cache_path):
         for f in files:
+            filepath = os.path.join(root, f)
+
+            # JSON 파일 검증
             if f.endswith(".json"):
-                filepath = os.path.join(root, f)
                 try:
                     with open(filepath, "r") as fh:
                         json.load(fh)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    corrupted_files.append(filepath)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                     print(f"[Cache] Corrupted JSON: {filepath}")
+                    corrupted = True
+                    break
 
-    if corrupted_files:
-        print(f"[Cache] Found {len(corrupted_files)} corrupted files. Cleaning...")
-        for f in corrupted_files:
-            os.remove(f)
-            print(f"[Cache] Removed: {f}")
-        shutil.rmtree(model_cache_path)
-        print(f"[Cache] Removed entire cache for clean re-download")
+            # 바이너리 모델 파일 검증 (최소 크기 체크)
+            elif f.endswith((".model", ".bin", ".safetensors")):
+                file_size = os.path.getsize(filepath)
+                if file_size < 1024:  # 1KB 미만 = 손상 가능성 높음
+                    print(f"[Cache] Corrupted binary (too small: {file_size}B): {filepath}")
+                    corrupted = True
+                    break
+
+        if corrupted:
+            break
+
+    if corrupted:
+        print(f"[Cache] Corrupted cache detected. Removing entire cache for clean re-download...")
+        shutil.rmtree(model_cache_path, ignore_errors=True)
+        print(f"[Cache] Removed: {model_cache_path}")
     else:
         print(f"[Cache] Cache is valid")
 
