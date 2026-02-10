@@ -1,247 +1,237 @@
 """
-RunPod Serverless Handler - Wan 2.1 Image-to-Video (720P)
-RunPod Serverless 엔드포인트에 배포하는 핸들러 스크립트
+RunPod Serverless Handler - CogVideoX-5B I2V
+Image-to-Video generation using CogVideoX-5B model (THUDM/Tsinghua)
 
-⚡ 720P 고화질 버전 - RunPod 클라우드 GPU (48GB+) 전용
-   로컬(RTX 3070)은 480P, 클라우드는 720P로 고품질 생성!
-
-배포 방법:
-1. RunPod 계정 생성: https://www.runpod.io
-2. Serverless → New Endpoint 생성
-3. GitHub 연동으로 자동 빌드/배포
-4. GPU Type: A40/A6000 (48GB) 이상 권장
+Model: THUDM/CogVideoX-5b-I2V
+Resolution: 480P (480x720, 720x480, etc.)
+VRAM: ~18GB (A100 80GB recommended)
 """
 
-import io
 import os
+import io
+import json
 import time
 import base64
-import logging
+import tempfile
+import traceback
+import shutil
+
 import torch
 from PIL import Image
 
-logger = logging.getLogger(__name__)
+import runpod
 
-# 전역 파이프라인 (cold start 시 한 번만 로드)
-pipe = None
-MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+# --- Configuration ---
+MODEL_ID = "THUDM/CogVideoX-5b-I2V"
+CACHE_DIR = "/runpod-volume/huggingface"
 
+# CogVideoX 지원 해상도 (H, W) - 480P 기반
+# 반드시 16의 배수여야 함
 SUPPORTED_RESOLUTIONS = {
-    "16:9": (720, 1280),
-    "4:3": (720, 960),
-    "1:1": (720, 720),
-    "9:16": (1280, 720),
-    "3:4": (960, 720),
+    "16:9": (480, 720),
+    "4:3": (480, 640),
+    "1:1": (480, 480),
+    "9:16": (720, 480),
+    "3:4": (640, 480),
 }
 
+pipe = None
+gpu_name = "Unknown"
 
-def validate_cache(cache_dir: str, model_id: str):
-    """캐시된 모델 파일이 손상되지 않았는지 검증, 손상 시 삭제"""
-    import json
-    import shutil
-    
-    model_cache = os.path.join(cache_dir, f"models--{model_id.replace('/', '--')}")
-    if not os.path.exists(model_cache):
-        logger.info("캐시 없음 - 새로 다운로드합니다")
+
+def validate_cache(cache_dir, model_id):
+    """Network Volume에 캐시된 모델 파일의 무결성을 검증"""
+    if not os.path.exists(cache_dir):
+        print(f"[Cache] Cache directory does not exist: {cache_dir}")
         return
-    
-    # 주요 JSON 설정 파일들 검증
-    corrupted = False
-    for root, dirs, files in os.walk(model_cache):
-        for fname in files:
-            if fname.endswith(".json"):
-                fpath = os.path.join(root, fname)
+
+    model_cache_path = os.path.join(
+        cache_dir, "models--" + model_id.replace("/", "--")
+    )
+    if not os.path.exists(model_cache_path):
+        print(f"[Cache] No cached model found at: {model_cache_path}")
+        return
+
+    print(f"[Cache] Validating cache at: {model_cache_path}")
+    corrupted_files = []
+
+    for root, dirs, files in os.walk(model_cache_path):
+        for f in files:
+            if f.endswith(".json"):
+                filepath = os.path.join(root, f)
                 try:
-                    with open(fpath, "r") as f:
-                        content = f.read().strip()
-                        if not content:
-                            raise ValueError("빈 파일")
-                        json.loads(content)
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"손상된 파일 발견: {fpath} ({e})")
-                    corrupted = True
-                    break
-        if corrupted:
-            break
-    
-    if corrupted:
-        logger.warning(f"손상된 캐시 삭제 중: {model_cache}")
-        shutil.rmtree(model_cache, ignore_errors=True)
-        logger.info("캐시 삭제 완료 - 새로 다운로드합니다")
+                    with open(filepath, "r") as fh:
+                        json.load(fh)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    corrupted_files.append(filepath)
+                    print(f"[Cache] Corrupted JSON: {filepath}")
+
+    if corrupted_files:
+        print(f"[Cache] Found {len(corrupted_files)} corrupted files. Cleaning...")
+        for f in corrupted_files:
+            os.remove(f)
+            print(f"[Cache] Removed: {f}")
+        shutil.rmtree(model_cache_path)
+        print(f"[Cache] Removed entire cache for clean re-download")
     else:
-        logger.info("캐시 검증 OK")
+        print(f"[Cache] Cache is valid")
 
 
 def load_model():
-    """모델을 GPU에 로드 (80GB A100 - 720P 모델)"""
-    global pipe
+    """CogVideoX-5B I2V 모델 로드"""
+    global pipe, gpu_name
+
     if pipe is not None:
         return
 
-    from diffusers import WanImageToVideoPipeline
-
-    # Network Volume에 모델 캐시 (/runpod-volume 마운트됨)
-    cache_dir = "/runpod-volume/huggingface"
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # 손상된 캐시 파일 자동 정리
-    validate_cache(cache_dir, MODEL_ID)
-
-    logger.info(f"모델 로딩 시작: {MODEL_ID} (캐시: {cache_dir})")
+    print(f"[Model] Loading {MODEL_ID}...")
     start = time.time()
 
-    pipe = WanImageToVideoPipeline.from_pretrained(
+    # GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
+
+    # Cache validation
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    validate_cache(CACHE_DIR, MODEL_ID)
+
+    from diffusers import CogVideoXImageToVideoPipeline
+
+    pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16,
-        cache_dir=cache_dir,
+        torch_dtype=torch.bfloat16,
+        cache_dir=CACHE_DIR,
     )
-    # 80GB GPU - 전체 모델을 GPU에 로드 (최대 성능)
     pipe.to("cuda")
 
     elapsed = time.time() - start
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
-    logger.info(f"모델 로드 완료! 시간: {elapsed:.1f}초, GPU: {gpu_name}")
+    print(f"[Model] Loaded in {elapsed:.1f}s")
 
 
-def prepare_image(image_b64: str, resolution: str = "auto") -> tuple:
-    """base64 이미지를 PIL Image로 변환 및 리사이즈"""
+def prepare_image(image_b64, resolution="auto"):
+    """base64 이미지를 PIL Image로 변환하고 적절한 해상도로 리사이즈"""
+    # Decode base64
     image_bytes = base64.b64decode(image_b64)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+    orig_w, orig_h = image.size
+    print(f"[Image] Original size: {orig_w}x{orig_h}")
+
+    # Determine target resolution
     if resolution == "auto":
-        w, h = image.size
-        aspect = w / h
-        best = min(
+        aspect_ratio = orig_w / orig_h
+        best_match = min(
             SUPPORTED_RESOLUTIONS.items(),
-            key=lambda x: abs((x[1][1] / x[1][0]) - aspect),
+            key=lambda x: abs((x[1][1] / x[1][0]) - aspect_ratio),
         )
-        target_h, target_w = best[1]
-        resolution = best[0]
+        resolution_name = best_match[0]
+        target_h, target_w = best_match[1]
     elif resolution in SUPPORTED_RESOLUTIONS:
+        resolution_name = resolution
         target_h, target_w = SUPPORTED_RESOLUTIONS[resolution]
     else:
-        target_h, target_w = 480, 832
-        resolution = "16:9"
+        resolution_name = "16:9"
+        target_h, target_w = SUPPORTED_RESOLUTIONS["16:9"]
 
+    # Resize
     image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    return image, target_h, target_w, resolution
+    print(f"[Image] Resized to: {target_w}x{target_h} ({resolution_name})")
+
+    return image, target_h, target_w, resolution_name
 
 
 def handler(job):
-    """
-    RunPod Serverless 핸들러
-
-    Input:
-        image_base64: str - base64 인코딩된 입력 이미지
-        prompt: str - 동작/장면 설명 프롬프트
-        negative_prompt: str - 네거티브 프롬프트 (선택)
-        num_frames: int - 생성할 프레임 수 (기본: 33)
-        num_inference_steps: int - 추론 스텝 (기본: 25)
-        guidance_scale: float - 가이던스 스케일 (기본: 5.0)
-        seed: int - 시드 (기본: -1, 랜덤)
-        resolution: str - 해상도 (기본: auto)
-        fps: int - FPS (기본: 16)
-
-    Output:
-        video_base64: str - base64 인코딩된 MP4 비디오
-        generation_time: float - 생성 시간(초)
-        resolution: str - 출력 해상도
-        gpu_name: str - 사용된 GPU
-        num_frames: int - 실제 생성 프레임 수
-    """
-    # 모델 로드 (cold start 시만)
-    load_model()
-
-    input_data = job["input"]
-
-    # 파라미터 추출
-    image_b64 = input_data.get("image_base64")
-    if not image_b64:
-        return {"error": "image_base64 is required"}
-
-    prompt = input_data.get("prompt", "")
-    negative_prompt = input_data.get("negative_prompt", "")
-    num_frames = int(input_data.get("num_frames", 33))
-    num_inference_steps = int(input_data.get("num_inference_steps", 25))
-    guidance_scale = float(input_data.get("guidance_scale", 5.0))
-    seed = int(input_data.get("seed", -1))
-    resolution = input_data.get("resolution", "auto")
-    fps = int(input_data.get("fps", 16))
+    """RunPod serverless handler - CogVideoX I2V"""
+    global pipe
 
     try:
-        # 이미지 전처리
-        image, height, width, res_name = prepare_image(image_b64, resolution)
+        job_input = job["input"]
 
-        # 시드 설정
+        # Load model if not loaded
+        load_model()
+
+        # Parse inputs
+        image_b64 = job_input.get("image_base64")
+        if not image_b64:
+            return {"error": "image_base64 is required"}
+
+        prompt = job_input.get("prompt", "")
+        negative_prompt = job_input.get("negative_prompt", "")
+        num_frames = int(job_input.get("num_frames", 49))
+        num_inference_steps = int(job_input.get("num_inference_steps", 50))
+        guidance_scale = float(job_input.get("guidance_scale", 6.0))
+        seed = int(job_input.get("seed", -1))
+        resolution = job_input.get("resolution", "auto")
+        fps = int(job_input.get("fps", 8))
+
+        # Prepare image
+        image, height, width, resolution_name = prepare_image(image_b64, resolution)
+
+        # Seed
         if seed < 0:
-            seed = torch.randint(0, 2**32 - 1, (1,)).item()
+            seed = torch.randint(0, 2**31, (1,)).item()
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-        # VRAM 초기화
-        torch.cuda.reset_peak_memory_stats()
-
-        # 생성
-        logger.info(
-            f"생성 시작: {width}x{height}, {num_frames}프레임, "
-            f"{num_inference_steps}스텝, seed={seed}"
+        print(
+            f"[Generate] prompt='{prompt[:80]}', frames={num_frames}, "
+            f"steps={num_inference_steps}, guidance={guidance_scale}, seed={seed}, "
+            f"resolution={width}x{height}"
         )
+
+        # Build pipeline kwargs
+        pipe_kwargs = {
+            "image": image,
+            "prompt": prompt,
+            "num_frames": num_frames,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+        }
+
+        # Add negative prompt only if provided
+        if negative_prompt:
+            pipe_kwargs["negative_prompt"] = negative_prompt
+
+        # Generate video
         start_time = time.time()
 
-        output = pipe(
-            image=image,
-            prompt=prompt,
-            negative_prompt=negative_prompt if negative_prompt else None,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-        )
+        with torch.no_grad():
+            output = pipe(**pipe_kwargs)
 
         generation_time = time.time() - start_time
+        print(f"[Generate] Done in {generation_time:.1f}s")
 
-        # 비디오를 base64로 인코딩
+        # Export video to MP4
         from diffusers.utils import export_to_video
 
-        tmp_path = "/tmp/output_video.mp4"
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+
         export_to_video(output.frames[0], tmp_path, fps=fps)
 
+        # Read and encode to base64
         with open(tmp_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # 정리
-        os.remove(tmp_path)
-        vram_peak = round(torch.cuda.max_memory_allocated() / 1024**3, 2)
-        gpu_name = torch.cuda.get_device_name(0)
-
-        logger.info(
-            f"생성 완료! 시간: {generation_time:.1f}초, "
-            f"VRAM: {vram_peak}GB, GPU: {gpu_name}"
-        )
+        # Cleanup temp file
+        os.unlink(tmp_path)
 
         return {
             "video_base64": video_b64,
             "generation_time": round(generation_time, 1),
-            "resolution": f"{width}x{height} ({res_name})",
-            "gpu_name": gpu_name,
-            "vram_peak_gb": vram_peak,
-            "num_frames": num_frames,
             "seed": seed,
+            "num_frames": num_frames,
+            "resolution": f"{width}x{height} ({resolution_name})",
+            "gpu_name": gpu_name,
         }
 
-    except torch.cuda.OutOfMemoryError:
-        return {
-            "error": "GPU 메모리 부족. 프레임 수나 해상도를 줄여주세요.",
-            "generation_time": 0,
-        }
     except Exception as e:
-        logger.error(f"생성 실패: {e}", exc_info=True)
-        return {"error": str(e), "generation_time": 0}
+        traceback.print_exc()
+        return {"error": str(e)}
 
 
-# RunPod Serverless 시작
-if __name__ == "__main__":
-    import runpod
-
-    runpod.serverless.start({"handler": handler})
+# Start RunPod serverless
+load_model()
+runpod.serverless.start({"handler": handler})
