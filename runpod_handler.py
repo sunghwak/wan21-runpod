@@ -253,7 +253,7 @@ def load_model():
         print(f"[Disk] WARNING: Very low disk space! Model download may fail.")
 
     # Step 4: 모델 로드 (없으면 자동 다운로드)
-    from diffusers import CogVideoXImageToVideoPipeline
+    from diffusers import CogVideoXImageToVideoPipeline, CogVideoXDPMScheduler
 
     print(f"[Model] Loading from HuggingFace (cache: {CACHE_DIR})...")
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
@@ -262,7 +262,14 @@ def load_model():
         cache_dir=CACHE_DIR,
     )
 
-    # CogVideoX 3D VAE 필수 설정 (이것 없으면 격자 아티팩트 발생!)
+    # 공식 권장 스케줄러: CogVideoXDPMScheduler + timestep_spacing="trailing"
+    # (이것 없으면 디노이징 타임스텝이 잘못되어 격자 아티팩트 발생!)
+    pipe.scheduler = CogVideoXDPMScheduler.from_config(
+        pipe.scheduler.config, timestep_spacing="trailing"
+    )
+    print(f"[Model] Scheduler: CogVideoXDPMScheduler (timestep_spacing=trailing)")
+
+    # CogVideoX 3D VAE 필수 설정
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
     print(f"[Model] VAE tiling + slicing enabled")
@@ -355,7 +362,7 @@ def handler(job):
             f"resolution={width}x{height}"
         )
 
-        # Build pipeline kwargs (height/width 명시적 전달)
+        # Build pipeline kwargs (공식 cli_demo.py 기준)
         pipe_kwargs = {
             "image": image,
             "prompt": prompt,
@@ -365,6 +372,7 @@ def handler(job):
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "num_videos_per_prompt": 1,
+            "use_dynamic_cfg": True,  # DPM 스케줄러 필수 옵션 (공식 권장)
             "generator": generator,
         }
 
