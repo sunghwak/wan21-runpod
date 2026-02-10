@@ -261,7 +261,21 @@ def load_model():
         torch_dtype=torch.bfloat16,
         cache_dir=CACHE_DIR,
     )
-    pipe.to("cuda")
+
+    # CogVideoX 3D VAE 필수 설정 (이것 없으면 격자 아티팩트 발생!)
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+    print(f"[Model] VAE tiling + slicing enabled")
+
+    # GPU 배치: A100-80GB면 full GPU, 아니면 CPU offload
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if vram_gb >= 40:
+            pipe.to("cuda")
+            print(f"[Model] Full GPU mode ({vram_gb:.0f}GB VRAM)")
+        else:
+            pipe.enable_model_cpu_offload()
+            print(f"[Model] CPU offload mode ({vram_gb:.0f}GB VRAM)")
 
     elapsed = time.time() - start
     print(f"[Model] Loaded in {elapsed:.1f}s")
@@ -330,10 +344,10 @@ def handler(job):
         # Prepare image
         image, height, width, resolution_name = prepare_image(image_b64, resolution)
 
-        # Seed
+        # Seed (CogVideoX 공식: generator는 "cpu" 디바이스 사용)
         if seed < 0:
             seed = torch.randint(0, 2**31, (1,)).item()
-        generator = torch.Generator(device="cuda").manual_seed(seed)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
 
         print(
             f"[Generate] prompt='{prompt[:80]}', frames={num_frames}, "
@@ -341,13 +355,16 @@ def handler(job):
             f"resolution={width}x{height}"
         )
 
-        # Build pipeline kwargs
+        # Build pipeline kwargs (height/width 명시적 전달)
         pipe_kwargs = {
             "image": image,
             "prompt": prompt,
+            "height": height,
+            "width": width,
             "num_frames": num_frames,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
+            "num_videos_per_prompt": 1,
             "generator": generator,
         }
 
