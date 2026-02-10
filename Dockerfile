@@ -1,5 +1,5 @@
-# CogVideoX-5B I2V - RunPod Serverless Docker Image
-# Model: THUDM/CogVideoX-5b-I2V (~10GB)
+# CogVideoX1.5-5B I2V - RunPod Serverless Docker Image
+# Model: THUDM/CogVideoX1.5-5b-I2V (~12GB)
 # Base: python:3.11-slim (~150MB, pytorch 이미지 대비 ~4GB 절약)
 
 FROM python:3.11-slim

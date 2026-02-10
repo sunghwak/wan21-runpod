@@ -1,10 +1,11 @@
 """
-RunPod Serverless Handler - CogVideoX-5B I2V
-Image-to-Video generation using CogVideoX-5B model (THUDM/Tsinghua)
+RunPod Serverless Handler - CogVideoX1.5-5B I2V
+Image-to-Video generation using CogVideoX1.5-5B model (THUDM/Tsinghua)
 
-Model: THUDM/CogVideoX-5b-I2V
-Resolution: 480P (480x720, 720x480, etc.)
-VRAM: ~18GB (A100 80GB recommended)
+Model: THUDM/CogVideoX1.5-5b-I2V
+Resolution: 768x1360 (default), custom supported
+Frames: 81 (5s@16fps) or 161 (10s@16fps)
+VRAM: ~24GB (A100 80GB recommended)
 """
 
 import os
@@ -22,25 +23,28 @@ from PIL import Image
 import runpod
 
 # --- Configuration ---
-MODEL_ID = "THUDM/CogVideoX-5b-I2V"
+MODEL_ID = "THUDM/CogVideoX1.5-5b-I2V"
 CACHE_DIR = "/runpod-volume/huggingface"
 
 # 캐시 버전: 이 값을 변경하면 Network Volume의 모델 캐시가 강제 삭제 후 재다운로드됨
-# v2: 이전 disk quota 에러로 손상된 safetensors 파일 제거
-CACHE_VERSION = "cogvideox-5b-clean-v2"
+# v1: CogVideoX 1.5 최초 배포
+CACHE_VERSION = "cogvideox1.5-5b-i2v-v1"
 
-# CogVideoX-5B safetensors 최소 크기 기준
+# CogVideoX1.5-5B safetensors 최소 크기 기준
 # 실제 파일은 수백MB~수GB이므로 10MB 미만이면 불완전 다운로드로 판단
 SAFETENSORS_MIN_SIZE_MB = 10
 
-# CogVideoX 지원 해상도 (H, W) - 480P 기반
-# 반드시 16의 배수여야 함
+# CogVideoX1.5-5B-I2V 기본 해상도 (공식 권장: 768x1360)
+DEFAULT_HEIGHT = 768
+DEFAULT_WIDTH = 1360
+
+# CogVideoX1.5 지원 해상도 (height, width) - I2V는 커스텀 해상도도 지원
 SUPPORTED_RESOLUTIONS = {
-    "16:9": (480, 720),
-    "4:3": (480, 640),
-    "1:1": (480, 480),
-    "9:16": (720, 480),
-    "3:4": (640, 480),
+    "16:9": (768, 1360),   # 기본 권장
+    "9:16": (1360, 768),   # 세로형
+    "4:3": (768, 1024),    # 4:3
+    "3:4": (1024, 768),    # 세로 4:3
+    "1:1": (768, 768),     # 정사각형
 }
 
 pipe = None
@@ -162,7 +166,7 @@ def validate_cache(cache_dir, model_id):
         if corrupted:
             break
 
-    # safetensors 총 크기 검증 (CogVideoX-5B = 약 10GB 이상이어야 함)
+    # safetensors 총 크기 검증 (CogVideoX1.5-5B = 약 10GB 이상이어야 함)
     if not corrupted:
         total_gb = total_safetensors_size / (1024**3)
         print(f"[Cache] Found {len(safetensors_files)} safetensors files, total: {total_gb:.2f} GB")
@@ -214,7 +218,7 @@ def cleanup_old_models(cache_dir, current_model_id):
 
 
 def load_model():
-    """CogVideoX-5B I2V 모델 로드"""
+    """CogVideoX1.5-5B I2V 모델 로드"""
     global pipe, gpu_name
 
     if pipe is not None:
@@ -233,7 +237,7 @@ def load_model():
     # 캐시 디렉토리 생성
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # Step 1: 이전 모델(Wan 2.1 등) 캐시 삭제
+    # Step 1: 이전 모델(CogVideoX 1.0, Wan 2.1 등) 캐시 삭제
     cleanup_old_models(CACHE_DIR, MODEL_ID)
 
     # Step 2: 버전 마커 확인 → 불일치 시 강제 전체 삭제
@@ -263,7 +267,6 @@ def load_model():
     )
 
     # 공식 권장 스케줄러: CogVideoXDPMScheduler + timestep_spacing="trailing"
-    # (이것 없으면 디노이징 타임스텝이 잘못되어 격자 아티팩트 발생!)
     pipe.scheduler = CogVideoXDPMScheduler.from_config(
         pipe.scheduler.config, timestep_spacing="trailing"
     )
@@ -292,8 +295,12 @@ def load_model():
     print(f"[Model] Ready for inference!")
 
 
-def prepare_image(image_b64, resolution="auto"):
-    """base64 이미지를 PIL Image로 변환하고 적절한 해상도로 리사이즈"""
+def prepare_image(image_b64, target_height=None, target_width=None):
+    """base64 이미지를 PIL Image로 변환하고 지정 해상도로 리사이즈
+
+    CogVideoX1.5-5B-I2V는 커스텀 해상도 지원.
+    기본값: 768x1360 (height x width)
+    """
     # Decode base64
     image_bytes = base64.b64decode(image_b64)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -301,31 +308,52 @@ def prepare_image(image_b64, resolution="auto"):
     orig_w, orig_h = image.size
     print(f"[Image] Original size: {orig_w}x{orig_h}")
 
-    # Determine target resolution
-    if resolution == "auto":
-        aspect_ratio = orig_w / orig_h
-        best_match = min(
-            SUPPORTED_RESOLUTIONS.items(),
-            key=lambda x: abs((x[1][1] / x[1][0]) - aspect_ratio),
-        )
-        resolution_name = best_match[0]
-        target_h, target_w = best_match[1]
-    elif resolution in SUPPORTED_RESOLUTIONS:
-        resolution_name = resolution
-        target_h, target_w = SUPPORTED_RESOLUTIONS[resolution]
-    else:
-        resolution_name = "16:9"
-        target_h, target_w = SUPPORTED_RESOLUTIONS["16:9"]
+    # 목표 해상도 결정
+    if target_height is None:
+        target_height = DEFAULT_HEIGHT
+    if target_width is None:
+        target_width = DEFAULT_WIDTH
 
-    # Resize
-    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    print(f"[Image] Resized to: {target_w}x{target_h} ({resolution_name})")
+    image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    print(f"[Image] Resized to: {target_width}x{target_height}")
 
-    return image, target_h, target_w, resolution_name
+    return image
+
+
+def resolve_resolution(resolution_str):
+    """해상도 문자열을 (height, width) 튜플로 변환
+
+    지원 형식:
+    - "auto" 또는 "16:9" → 기본 권장 해상도 (768x1360)
+    - "9:16", "4:3", "3:4", "1:1" → SUPPORTED_RESOLUTIONS에서 조회
+    - "HxW" 형식 (예: "768x1360") → 직접 파싱
+    """
+    if not resolution_str or resolution_str == "auto":
+        return DEFAULT_HEIGHT, DEFAULT_WIDTH
+
+    # SUPPORTED_RESOLUTIONS에서 조회
+    if resolution_str in SUPPORTED_RESOLUTIONS:
+        return SUPPORTED_RESOLUTIONS[resolution_str]
+
+    # "HxW" 형식 파싱
+    if "x" in resolution_str:
+        try:
+            parts = resolution_str.lower().split("x")
+            h, w = int(parts[0]), int(parts[1])
+            # 8의 배수로 정렬 (VAE 요구사항)
+            h = (h // 8) * 8
+            w = (w // 8) * 8
+            return h, w
+        except (ValueError, IndexError):
+            pass
+
+    # 파싱 실패 시 기본값
+    print(f"[Resolution] Unknown format '{resolution_str}', using default {DEFAULT_HEIGHT}x{DEFAULT_WIDTH}")
+    return DEFAULT_HEIGHT, DEFAULT_WIDTH
 
 
 def handler(job):
-    """RunPod serverless handler - CogVideoX I2V"""
+    """RunPod serverless handler - CogVideoX1.5 I2V"""
     global pipe
 
     try:
@@ -341,38 +369,42 @@ def handler(job):
 
         prompt = job_input.get("prompt", "")
         negative_prompt = job_input.get("negative_prompt", "")
-        num_frames = int(job_input.get("num_frames", 49))
+        num_frames = int(job_input.get("num_frames", 81))
         num_inference_steps = int(job_input.get("num_inference_steps", 50))
         guidance_scale = float(job_input.get("guidance_scale", 6.0))
         seed = int(job_input.get("seed", -1))
+        fps = int(job_input.get("fps", 16))
         resolution = job_input.get("resolution", "auto")
-        fps = int(job_input.get("fps", 8))
+
+        # 해상도 결정 (CogVideoX1.5는 커스텀 해상도 지원)
+        target_height, target_width = resolve_resolution(resolution)
 
         # Prepare image
-        image, height, width, resolution_name = prepare_image(image_b64, resolution)
+        image = prepare_image(image_b64, target_height, target_width)
 
-        # Seed (CogVideoX 공식: generator는 "cpu" 디바이스 사용)
+        # Seed (공식: generator는 device 미지정 = CPU)
         if seed < 0:
             seed = torch.randint(0, 2**31, (1,)).item()
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        generator = torch.Generator().manual_seed(seed)
 
         print(
             f"[Generate] prompt='{prompt[:80]}', frames={num_frames}, "
             f"steps={num_inference_steps}, guidance={guidance_scale}, seed={seed}, "
-            f"resolution={width}x{height}"
+            f"resolution={target_width}x{target_height}, fps={fps}"
         )
 
         # Build pipeline kwargs (공식 cli_demo.py 기준)
+        # CogVideoX1.5-5B-I2V는 height/width 전달 지원
         pipe_kwargs = {
             "image": image,
             "prompt": prompt,
-            "height": height,
-            "width": width,
+            "height": target_height,
+            "width": target_width,
             "num_frames": num_frames,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "num_videos_per_prompt": 1,
-            "use_dynamic_cfg": True,  # DPM 스케줄러 필수 옵션 (공식 권장)
+            "use_dynamic_cfg": True,
             "generator": generator,
         }
 
@@ -409,7 +441,7 @@ def handler(job):
             "generation_time": round(generation_time, 1),
             "seed": seed,
             "num_frames": num_frames,
-            "resolution": f"{width}x{height} ({resolution_name})",
+            "resolution": f"{target_width}x{target_height}",
             "gpu_name": gpu_name,
         }
 
