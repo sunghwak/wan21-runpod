@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir \
 # - accelerate: 모델 로드 가속
 RUN pip install --no-cache-dir \
     "diffusers>=0.32.0" \
-    "transformers>=4.44.0" \
+    "transformers==4.44.2" \
     accelerate \
     sentencepiece \
     tiktoken \
