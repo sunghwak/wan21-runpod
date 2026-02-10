@@ -25,6 +25,14 @@ import runpod
 MODEL_ID = "THUDM/CogVideoX-5b-I2V"
 CACHE_DIR = "/runpod-volume/huggingface"
 
+# 캐시 버전: 이 값을 변경하면 Network Volume의 모델 캐시가 강제 삭제 후 재다운로드됨
+# v2: 이전 disk quota 에러로 손상된 safetensors 파일 제거
+CACHE_VERSION = "cogvideox-5b-clean-v2"
+
+# CogVideoX-5B safetensors 최소 크기 기준
+# 실제 파일은 수백MB~수GB이므로 10MB 미만이면 불완전 다운로드로 판단
+SAFETENSORS_MIN_SIZE_MB = 10
+
 # CogVideoX 지원 해상도 (H, W) - 480P 기반
 # 반드시 16의 배수여야 함
 SUPPORTED_RESOLUTIONS = {
@@ -39,21 +47,83 @@ pipe = None
 gpu_name = "Unknown"
 
 
+def get_cache_marker_path(cache_dir):
+    """캐시 버전 마커 파일 경로 반환"""
+    return os.path.join(cache_dir, ".cache_version")
+
+
+def needs_force_clean(cache_dir):
+    """버전 마커를 확인하여 강제 재다운로드가 필요한지 판단"""
+    marker_path = get_cache_marker_path(cache_dir)
+
+    if not os.path.exists(marker_path):
+        print(f"[Cache] No version marker found - force clean needed")
+        return True
+
+    with open(marker_path, "r") as f:
+        stored_version = f.read().strip()
+
+    if stored_version != CACHE_VERSION:
+        print(f"[Cache] Version mismatch: stored='{stored_version}' vs expected='{CACHE_VERSION}'")
+        return True
+
+    print(f"[Cache] Version marker matches: {CACHE_VERSION}")
+    return False
+
+
+def mark_cache_valid(cache_dir):
+    """모델 로드 성공 후 버전 마커 기록"""
+    marker_path = get_cache_marker_path(cache_dir)
+    with open(marker_path, "w") as f:
+        f.write(CACHE_VERSION)
+    print(f"[Cache] Version marker written: {CACHE_VERSION}")
+
+
+def force_clean_model_cache(cache_dir, model_id):
+    """모델 캐시를 완전히 삭제하여 깨끗한 재다운로드 보장"""
+    model_cache_path = os.path.join(
+        cache_dir, "models--" + model_id.replace("/", "--")
+    )
+
+    if os.path.exists(model_cache_path):
+        # 기존 캐시 크기 계산
+        total_size = 0
+        file_count = 0
+        for dp, dn, filenames in os.walk(model_cache_path):
+            for f in filenames:
+                total_size += os.path.getsize(os.path.join(dp, f))
+                file_count += 1
+
+        print(f"[Cache] FORCE CLEAN: Removing {file_count} files ({total_size / (1024**3):.2f} GB)")
+        print(f"[Cache] Path: {model_cache_path}")
+        shutil.rmtree(model_cache_path, ignore_errors=True)
+        print(f"[Cache] Removed successfully. Will re-download from HuggingFace.")
+    else:
+        print(f"[Cache] No existing cache to clean at: {model_cache_path}")
+
+    # 버전 마커도 삭제
+    marker_path = get_cache_marker_path(cache_dir)
+    if os.path.exists(marker_path):
+        os.remove(marker_path)
+
+
 def validate_cache(cache_dir, model_id):
-    """Network Volume에 캐시된 모델 파일의 무결성을 검증 (JSON + 바이너리)"""
+    """Network Volume에 캐시된 모델 파일의 무결성을 철저히 검증"""
     if not os.path.exists(cache_dir):
         print(f"[Cache] Cache directory does not exist: {cache_dir}")
-        return
+        return False
 
     model_cache_path = os.path.join(
         cache_dir, "models--" + model_id.replace("/", "--")
     )
     if not os.path.exists(model_cache_path):
         print(f"[Cache] No cached model found at: {model_cache_path}")
-        return
+        return False
 
     print(f"[Cache] Validating cache at: {model_cache_path}")
     corrupted = False
+    safetensors_files = []
+    total_safetensors_size = 0
 
     for root, dirs, files in os.walk(model_cache_path):
         for f in files:
@@ -65,27 +135,57 @@ def validate_cache(cache_dir, model_id):
                     with open(filepath, "r") as fh:
                         json.load(fh)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-                    print(f"[Cache] Corrupted JSON: {filepath}")
+                    print(f"[Cache] CORRUPTED JSON: {filepath}")
                     corrupted = True
                     break
 
-            # 바이너리 모델 파일 검증 (최소 크기 체크)
-            elif f.endswith((".model", ".bin", ".safetensors")):
+            # safetensors 파일 검증 (무결성 핵심)
+            elif f.endswith(".safetensors"):
                 file_size = os.path.getsize(filepath)
-                if file_size < 1024:  # 1KB 미만 = 손상 가능성 높음
-                    print(f"[Cache] Corrupted binary (too small: {file_size}B): {filepath}")
+                file_size_mb = file_size / (1024 * 1024)
+                safetensors_files.append((f, file_size_mb))
+                total_safetensors_size += file_size
+
+                if file_size_mb < SAFETENSORS_MIN_SIZE_MB:
+                    print(f"[Cache] CORRUPTED safetensors (too small: {file_size_mb:.1f}MB): {filepath}")
+                    corrupted = True
+                    break
+
+            # 기타 바이너리 모델 파일
+            elif f.endswith((".model", ".bin")):
+                file_size = os.path.getsize(filepath)
+                if file_size < 1024:
+                    print(f"[Cache] CORRUPTED binary (too small: {file_size}B): {filepath}")
                     corrupted = True
                     break
 
         if corrupted:
             break
 
+    # safetensors 총 크기 검증 (CogVideoX-5B = 약 10GB 이상이어야 함)
+    if not corrupted:
+        total_gb = total_safetensors_size / (1024**3)
+        print(f"[Cache] Found {len(safetensors_files)} safetensors files, total: {total_gb:.2f} GB")
+
+        for name, size_mb in safetensors_files:
+            print(f"  - {name}: {size_mb:.1f} MB")
+
+        if total_gb < 5.0:
+            print(f"[Cache] CORRUPTED: Total safetensors size {total_gb:.2f}GB < 5GB minimum!")
+            corrupted = True
+
     if corrupted:
-        print(f"[Cache] Corrupted cache detected. Removing entire cache for clean re-download...")
+        print(f"[Cache] Corrupted cache detected! Removing for clean re-download...")
         shutil.rmtree(model_cache_path, ignore_errors=True)
+        # 마커도 삭제
+        marker_path = get_cache_marker_path(cache_dir)
+        if os.path.exists(marker_path):
+            os.remove(marker_path)
         print(f"[Cache] Removed: {model_cache_path}")
+        return False
     else:
-        print(f"[Cache] Cache is valid")
+        print(f"[Cache] All validations passed!")
+        return True
 
 
 def cleanup_old_models(cache_dir, current_model_id):
@@ -121,6 +221,7 @@ def load_model():
         return
 
     print(f"[Model] Loading {MODEL_ID}...")
+    print(f"[Model] Cache version: {CACHE_VERSION}")
     start = time.time()
 
     # GPU info
@@ -129,15 +230,32 @@ def load_model():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
 
-    # Clean up old model caches (Wan 2.1 etc.) to free disk space
+    # 캐시 디렉토리 생성
     os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Step 1: 이전 모델(Wan 2.1 등) 캐시 삭제
     cleanup_old_models(CACHE_DIR, MODEL_ID)
 
-    # Cache validation
-    validate_cache(CACHE_DIR, MODEL_ID)
+    # Step 2: 버전 마커 확인 → 불일치 시 강제 전체 삭제
+    if needs_force_clean(CACHE_DIR):
+        print(f"[Cache] === FORCE CLEAN MODE ===")
+        force_clean_model_cache(CACHE_DIR, MODEL_ID)
+    else:
+        # 마커 일치 시에도 safetensors 무결성 검증
+        validate_cache(CACHE_DIR, MODEL_ID)
 
+    # Step 3: 디스크 공간 확인
+    disk_stat = shutil.disk_usage(CACHE_DIR)
+    free_gb = disk_stat.free / (1024**3)
+    total_gb = disk_stat.total / (1024**3)
+    print(f"[Disk] Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB")
+    if free_gb < 2.0:
+        print(f"[Disk] WARNING: Very low disk space! Model download may fail.")
+
+    # Step 4: 모델 로드 (없으면 자동 다운로드)
     from diffusers import CogVideoXImageToVideoPipeline
 
+    print(f"[Model] Loading from HuggingFace (cache: {CACHE_DIR})...")
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
@@ -147,6 +265,10 @@ def load_model():
 
     elapsed = time.time() - start
     print(f"[Model] Loaded in {elapsed:.1f}s")
+
+    # Step 5: 로드 성공 → 버전 마커 기록
+    mark_cache_valid(CACHE_DIR)
+    print(f"[Model] Ready for inference!")
 
 
 def prepare_image(image_b64, resolution="auto"):
