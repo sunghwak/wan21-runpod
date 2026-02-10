@@ -77,6 +77,31 @@ def validate_cache(cache_dir, model_id):
         print(f"[Cache] Cache is valid")
 
 
+def cleanup_old_models(cache_dir, current_model_id):
+    """이전 모델 캐시를 삭제하여 디스크 공간 확보"""
+    if not os.path.exists(cache_dir):
+        return
+
+    current_cache_name = "models--" + current_model_id.replace("/", "--")
+
+    for item in os.listdir(cache_dir):
+        item_path = os.path.join(cache_dir, item)
+        if item.startswith("models--") and item != current_cache_name and os.path.isdir(item_path):
+            print(f"[Cleanup] Removing old model cache: {item}")
+            shutil.rmtree(item_path, ignore_errors=True)
+            print(f"[Cleanup] Removed: {item}")
+
+    # Also clean up any orphaned temp/lock files
+    for item in os.listdir(cache_dir):
+        item_path = os.path.join(cache_dir, item)
+        if item.endswith(".lock") or item.endswith(".tmp"):
+            try:
+                os.remove(item_path)
+                print(f"[Cleanup] Removed temp file: {item}")
+            except OSError:
+                pass
+
+
 def load_model():
     """CogVideoX-5B I2V 모델 로드"""
     global pipe, gpu_name
@@ -93,8 +118,11 @@ def load_model():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
 
-    # Cache validation
+    # Clean up old model caches (Wan 2.1 etc.) to free disk space
     os.makedirs(CACHE_DIR, exist_ok=True)
+    cleanup_old_models(CACHE_DIR, MODEL_ID)
+
+    # Cache validation
     validate_cache(CACHE_DIR, MODEL_ID)
 
     from diffusers import CogVideoXImageToVideoPipeline
