@@ -90,7 +90,7 @@ def load_model():
     # GPU info
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
 
     # Cache validation
