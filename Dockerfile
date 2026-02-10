@@ -1,6 +1,7 @@
-# CogVideoX1.5-5B I2V - RunPod Serverless Docker Image
-# Model: THUDM/CogVideoX1.5-5b-I2V (~12GB)
-# Base: python:3.11-slim (~150MB, pytorch 이미지 대비 ~4GB 절약)
+# Wan2.1-Fun-V1.3-InP - RunPod Serverless Docker Image
+# Model: alibaba-pai/Wan2.1-Fun-V1.3-InP (~37GB)
+# VideoX-Fun InPainting-based I2V (Wan 2.1 14B, uncensored)
+# Base: python:3.11-slim
 
 FROM python:3.11-slim
 
@@ -10,31 +11,35 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System dependencies (ffmpeg for video encoding)
+# System dependencies (ffmpeg for video encoding, git for pip installs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CUDA 12.1) - torchvision/torchaudio 제외하여 ~1.5GB 절약
+# PyTorch (CUDA 12.1) - torchvision/torchaudio excluded to save ~1.5GB
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu121
 
 # ML dependencies
-# - diffusers >= 0.32.0: CogVideoXImageToVideoPipeline 지원
-# - transformers >= 4.44.0: CogVideoX 모델 지원
-# - sentencepiece: T5 텍스트 인코더 토크나이저 필수
-# - accelerate: 모델 로드 가속
+# - diffusers >= 0.34.0: WanFunInpaintPipeline support
+# - transformers >= 4.46.0: Wan 2.1 model support
+# - sentencepiece: T5 text encoder tokenizer
+# - accelerate: model loading acceleration
 RUN pip install --no-cache-dir \
-    "diffusers>=0.32.0" \
-    "transformers==4.44.2" \
+    "diffusers>=0.34.0" \
+    "transformers>=4.46.0" \
     accelerate \
     sentencepiece \
-    tiktoken \
     ftfy \
     "imageio[ffmpeg]" \
     Pillow \
+    numpy \
     runpod
+
+# Install VideoX-Fun package (provides WanFunInpaintPipeline if not in diffusers)
+RUN pip install --no-cache-dir "git+https://github.com/aigc-apps/VideoX-Fun.git" || \
+    echo "VideoX-Fun install failed (optional, diffusers may have built-in support)"
 
 COPY runpod_handler.py /app/
 

@@ -1,11 +1,12 @@
 """
-RunPod Serverless Handler - CogVideoX1.5-5B I2V
-Image-to-Video generation using CogVideoX1.5-5B model (THUDM/Tsinghua)
+RunPod Serverless Handler - Wan2.1-Fun-V1.3-InP (Image-to-Video)
+VideoX-Fun InPainting-based I2V model (Alibaba PAI)
 
-Model: THUDM/CogVideoX1.5-5b-I2V
-Resolution: 768x1360 (default), custom supported
-Frames: 81 (5s@16fps) or 161 (10s@16fps)
-VRAM: ~24GB (A100 80GB recommended)
+Model: alibaba-pai/Wan2.1-Fun-V1.3-InP
+Base: Wan 2.1 14B (no safety alignment - uncensored)
+Resolution: Flexible (480x832 default, supports portrait/landscape/square)
+Frames: 81 (5s@16fps)
+VRAM: ~30GB (A100 80GB recommended)
 """
 
 import os
@@ -18,33 +19,36 @@ import traceback
 import shutil
 
 import torch
+import numpy as np
 from PIL import Image
 
 import runpod
 
 # --- Configuration ---
-MODEL_ID = "THUDM/CogVideoX1.5-5b-I2V"
+MODEL_ID = "alibaba-pai/Wan2.1-Fun-V1.3-InP"
 CACHE_DIR = "/runpod-volume/huggingface"
 
-# 캐시 버전: 이 값을 변경하면 Network Volume의 모델 캐시가 강제 삭제 후 재다운로드됨
-# v1: CogVideoX 1.5 최초 배포
-CACHE_VERSION = "cogvideox1.5-5b-i2v-v1"
+# Cache version: change this to force re-download on Network Volume
+CACHE_VERSION = "wan21-fun-v1.3-inp-v1"
 
-# CogVideoX1.5-5B safetensors 최소 크기 기준
-# 실제 파일은 수백MB~수GB이므로 10MB 미만이면 불완전 다운로드로 판단
+# Safetensors minimum size (incomplete downloads are smaller)
 SAFETENSORS_MIN_SIZE_MB = 10
 
-# CogVideoX1.5-5B-I2V 기본 해상도 (공식 권장: 768x1360)
-DEFAULT_HEIGHT = 768
-DEFAULT_WIDTH = 1360
+# Default resolution (Wan 2.1 standard 720P landscape)
+DEFAULT_HEIGHT = 480
+DEFAULT_WIDTH = 832
 
-# CogVideoX1.5 지원 해상도 (height, width)
-# ** 중요: height는 반드시 768이어야 함! height > 768이면 positional embedding 텐서 크기 불일치 에러 발생 **
-# 세로(portrait) 영상은 지원 불가 - 세로 이미지는 1:1(정사각형)으로 자동 변환
+# Wan2.1-Fun supports flexible resolutions (height, width)
+# Unlike CogVideoX, portrait is fully supported!
 SUPPORTED_RESOLUTIONS = {
-    "16:9": (768, 1360),   # 기본 권장 (가로형 와이드)
-    "4:3": (768, 1024),    # 가로형 표준
-    "1:1": (768, 768),     # 정사각형 (세로 이미지에 최적)
+    "16:9": (480, 832),     # landscape wide (default, fast)
+    "9:16": (832, 480),     # portrait tall (fast)
+    "4:3": (480, 640),      # landscape standard
+    "3:4": (640, 480),      # portrait standard
+    "1:1": (480, 480),      # square
+    "16:9-HD": (720, 1280), # HD landscape (slower, higher quality)
+    "9:16-HD": (1280, 720), # HD portrait (slower, higher quality)
+    "1:1-HD": (720, 720),   # HD square (slower, higher quality)
 }
 
 pipe = None
@@ -52,12 +56,12 @@ gpu_name = "Unknown"
 
 
 def get_cache_marker_path(cache_dir):
-    """캐시 버전 마커 파일 경로 반환"""
+    """Cache version marker file path"""
     return os.path.join(cache_dir, ".cache_version")
 
 
 def needs_force_clean(cache_dir):
-    """버전 마커를 확인하여 강제 재다운로드가 필요한지 판단"""
+    """Check version marker to determine if force re-download is needed"""
     marker_path = get_cache_marker_path(cache_dir)
 
     if not os.path.exists(marker_path):
@@ -76,7 +80,7 @@ def needs_force_clean(cache_dir):
 
 
 def mark_cache_valid(cache_dir):
-    """모델 로드 성공 후 버전 마커 기록"""
+    """Write version marker after successful model load"""
     marker_path = get_cache_marker_path(cache_dir)
     with open(marker_path, "w") as f:
         f.write(CACHE_VERSION)
@@ -84,13 +88,12 @@ def mark_cache_valid(cache_dir):
 
 
 def force_clean_model_cache(cache_dir, model_id):
-    """모델 캐시를 완전히 삭제하여 깨끗한 재다운로드 보장"""
+    """Completely remove model cache for clean re-download"""
     model_cache_path = os.path.join(
         cache_dir, "models--" + model_id.replace("/", "--")
     )
 
     if os.path.exists(model_cache_path):
-        # 기존 캐시 크기 계산
         total_size = 0
         file_count = 0
         for dp, dn, filenames in os.walk(model_cache_path):
@@ -105,14 +108,14 @@ def force_clean_model_cache(cache_dir, model_id):
     else:
         print(f"[Cache] No existing cache to clean at: {model_cache_path}")
 
-    # 버전 마커도 삭제
+    # Also remove version marker
     marker_path = get_cache_marker_path(cache_dir)
     if os.path.exists(marker_path):
         os.remove(marker_path)
 
 
 def validate_cache(cache_dir, model_id):
-    """Network Volume에 캐시된 모델 파일의 무결성을 철저히 검증"""
+    """Validate integrity of cached model files on Network Volume"""
     if not os.path.exists(cache_dir):
         print(f"[Cache] Cache directory does not exist: {cache_dir}")
         return False
@@ -133,7 +136,7 @@ def validate_cache(cache_dir, model_id):
         for f in files:
             filepath = os.path.join(root, f)
 
-            # JSON 파일 검증
+            # JSON file validation
             if f.endswith(".json"):
                 try:
                     with open(filepath, "r") as fh:
@@ -143,7 +146,7 @@ def validate_cache(cache_dir, model_id):
                     corrupted = True
                     break
 
-            # safetensors 파일 검증 (무결성 핵심)
+            # Safetensors validation
             elif f.endswith(".safetensors"):
                 file_size = os.path.getsize(filepath)
                 file_size_mb = file_size / (1024 * 1024)
@@ -155,7 +158,7 @@ def validate_cache(cache_dir, model_id):
                     corrupted = True
                     break
 
-            # 기타 바이너리 모델 파일
+            # Binary model files
             elif f.endswith((".model", ".bin")):
                 file_size = os.path.getsize(filepath)
                 if file_size < 1024:
@@ -166,7 +169,7 @@ def validate_cache(cache_dir, model_id):
         if corrupted:
             break
 
-    # safetensors 총 크기 검증 (CogVideoX1.5-5B = 약 10GB 이상이어야 함)
+    # Total safetensors size check (Wan 2.1 14B ~ 28GB+ in safetensors)
     if not corrupted:
         total_gb = total_safetensors_size / (1024**3)
         print(f"[Cache] Found {len(safetensors_files)} safetensors files, total: {total_gb:.2f} GB")
@@ -181,7 +184,6 @@ def validate_cache(cache_dir, model_id):
     if corrupted:
         print(f"[Cache] Corrupted cache detected! Removing for clean re-download...")
         shutil.rmtree(model_cache_path, ignore_errors=True)
-        # 마커도 삭제
         marker_path = get_cache_marker_path(cache_dir)
         if os.path.exists(marker_path):
             os.remove(marker_path)
@@ -193,7 +195,7 @@ def validate_cache(cache_dir, model_id):
 
 
 def cleanup_old_models(cache_dir, current_model_id):
-    """이전 모델 캐시를 삭제하여 디스크 공간 확보"""
+    """Remove old model caches to free disk space"""
     if not os.path.exists(cache_dir):
         return
 
@@ -206,7 +208,7 @@ def cleanup_old_models(cache_dir, current_model_id):
             shutil.rmtree(item_path, ignore_errors=True)
             print(f"[Cleanup] Removed: {item}")
 
-    # Also clean up any orphaned temp/lock files
+    # Clean orphaned temp/lock files
     for item in os.listdir(cache_dir):
         item_path = os.path.join(cache_dir, item)
         if item.endswith(".lock") or item.endswith(".tmp"):
@@ -218,7 +220,7 @@ def cleanup_old_models(cache_dir, current_model_id):
 
 
 def load_model():
-    """CogVideoX1.5-5B I2V 모델 로드"""
+    """Load Wan2.1-Fun-V1.3-InP model"""
     global pipe, gpu_name
 
     if pipe is not None:
@@ -234,50 +236,91 @@ def load_model():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
 
-    # 캐시 디렉토리 생성
+    # Create cache directory
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # Step 1: 이전 모델(CogVideoX 1.0, Wan 2.1 등) 캐시 삭제
+    # Step 1: Clean up old models (CogVideoX, etc.)
     cleanup_old_models(CACHE_DIR, MODEL_ID)
 
-    # Step 2: 버전 마커 확인 → 불일치 시 강제 전체 삭제
+    # Step 2: Check version marker → force clean if mismatch
     if needs_force_clean(CACHE_DIR):
         print(f"[Cache] === FORCE CLEAN MODE ===")
         force_clean_model_cache(CACHE_DIR, MODEL_ID)
     else:
-        # 마커 일치 시에도 safetensors 무결성 검증
         validate_cache(CACHE_DIR, MODEL_ID)
 
-    # Step 3: 디스크 공간 확인
+    # Step 3: Check disk space
     disk_stat = shutil.disk_usage(CACHE_DIR)
     free_gb = disk_stat.free / (1024**3)
     total_gb = disk_stat.total / (1024**3)
     print(f"[Disk] Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB")
-    if free_gb < 2.0:
-        print(f"[Disk] WARNING: Very low disk space! Model download may fail.")
+    if free_gb < 5.0:
+        print(f"[Disk] WARNING: Low disk space! Model download may fail (need ~37GB).")
 
-    # Step 4: 모델 로드 (없으면 자동 다운로드)
-    from diffusers import CogVideoXImageToVideoPipeline, CogVideoXDPMScheduler
+    # Step 4: Load pipeline
+    # Try diffusers auto-detect first (works if diffusers has WanFunInpaintPipeline)
+    pipeline_loaded = False
 
-    print(f"[Model] Loading from HuggingFace (cache: {CACHE_DIR})...")
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        cache_dir=CACHE_DIR,
-    )
+    # Approach 1: Auto-detect from model_index.json
+    try:
+        from diffusers import DiffusionPipeline
+        print(f"[Model] Trying DiffusionPipeline.from_pretrained (auto-detect)...")
+        pipe = DiffusionPipeline.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            cache_dir=CACHE_DIR,
+        )
+        pipeline_loaded = True
+        print(f"[Model] Loaded via DiffusionPipeline auto-detect: {type(pipe).__name__}")
+    except Exception as e1:
+        print(f"[Model] Auto-detect failed: {e1}")
 
-    # 공식 권장 스케줄러: CogVideoXDPMScheduler + timestep_spacing="trailing"
-    pipe.scheduler = CogVideoXDPMScheduler.from_config(
-        pipe.scheduler.config, timestep_spacing="trailing"
-    )
-    print(f"[Model] Scheduler: CogVideoXDPMScheduler (timestep_spacing=trailing)")
+        # Approach 2: Explicit WanFunInpaintPipeline
+        try:
+            from diffusers import WanFunInpaintPipeline
+            print(f"[Model] Trying WanFunInpaintPipeline explicitly...")
+            pipe = WanFunInpaintPipeline.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.bfloat16,
+                cache_dir=CACHE_DIR,
+            )
+            pipeline_loaded = True
+            print(f"[Model] Loaded via WanFunInpaintPipeline")
+        except Exception as e2:
+            print(f"[Model] WanFunInpaintPipeline failed: {e2}")
 
-    # CogVideoX 3D VAE 필수 설정
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
-    print(f"[Model] VAE tiling + slicing enabled")
+            # Approach 3: Use VideoX-Fun's pipeline (if installed)
+            try:
+                import sys
+                # Try importing from videox_fun package
+                from videox_fun.pipelines.pipeline_wan_fun_inpaint import WanFunInpaintPipeline as VXPipeline
+                print(f"[Model] Trying VideoX-Fun pipeline...")
+                pipe = VXPipeline.from_pretrained(
+                    MODEL_ID,
+                    torch_dtype=torch.bfloat16,
+                    cache_dir=CACHE_DIR,
+                )
+                pipeline_loaded = True
+                print(f"[Model] Loaded via VideoX-Fun pipeline")
+            except Exception as e3:
+                print(f"[Model] VideoX-Fun pipeline failed: {e3}")
+                raise RuntimeError(
+                    f"Failed to load model with all approaches:\n"
+                    f"  1) DiffusionPipeline: {e1}\n"
+                    f"  2) WanFunInpaintPipeline: {e2}\n"
+                    f"  3) VideoX-Fun: {e3}"
+                )
 
-    # GPU 배치: A100-80GB면 full GPU, 아니면 CPU offload
+    # Enable VAE optimizations if available
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        if hasattr(pipe.vae, 'enable_tiling'):
+            pipe.vae.enable_tiling()
+            print(f"[Model] VAE tiling enabled")
+        if hasattr(pipe.vae, 'enable_slicing'):
+            pipe.vae.enable_slicing()
+            print(f"[Model] VAE slicing enabled")
+
+    # GPU placement
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         if vram_gb >= 40:
@@ -290,54 +333,53 @@ def load_model():
     elapsed = time.time() - start
     print(f"[Model] Loaded in {elapsed:.1f}s")
 
-    # Step 5: 로드 성공 → 버전 마커 기록
+    # Step 5: Mark cache valid
     mark_cache_valid(CACHE_DIR)
     print(f"[Model] Ready for inference!")
 
 
 def detect_best_resolution(orig_w, orig_h):
-    """입력 이미지의 비율을 감지하여 가장 적합한 CogVideoX1.5 해상도 반환
+    """Detect best resolution based on input image aspect ratio
 
-    CogVideoX1.5 제약: height는 반드시 768이어야 함 (positional embedding 제약)
-    - 가로 이미지 → 16:9(1360x768) 또는 4:3(1024x768)
-    - 정사각형 이미지 → 1:1(768x768)
-    - 세로 이미지 → 1:1(768x768) (세로 해상도는 지원 불가)
+    Wan2.1-Fun supports flexible resolutions including portrait!
     """
     aspect = orig_w / orig_h
 
-    if aspect < 0.9:
-        # 세로 이미지: 1:1 정사각형이 최선 (height > 768 불가)
-        print(f"[Resolution] Portrait image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 1:1 (768x768)")
-        print(f"[Resolution] Note: CogVideoX1.5 does not support height > 768, using square crop")
-        return 768, 768
-    elif aspect < 1.15:
-        # 거의 정사각형
-        print(f"[Resolution] Square-ish image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 1:1 (768x768)")
-        return 768, 768
-    elif aspect < 1.5:
-        # 4:3 가로
-        print(f"[Resolution] Landscape image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 4:3 (1024x768)")
-        return 768, 1024
+    if aspect > 1.5:
+        # Wide landscape (16:9)
+        res = SUPPORTED_RESOLUTIONS["16:9"]
+        name = "16:9"
+    elif aspect > 1.15:
+        # Standard landscape (4:3)
+        res = SUPPORTED_RESOLUTIONS["4:3"]
+        name = "4:3"
+    elif aspect > 0.85:
+        # Square-ish (1:1)
+        res = SUPPORTED_RESOLUTIONS["1:1"]
+        name = "1:1"
+    elif aspect > 0.65:
+        # Standard portrait (3:4)
+        res = SUPPORTED_RESOLUTIONS["3:4"]
+        name = "3:4"
     else:
-        # 16:9 와이드
-        print(f"[Resolution] Wide image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 16:9 (1360x768)")
-        return 768, 1360
+        # Tall portrait (9:16)
+        res = SUPPORTED_RESOLUTIONS["9:16"]
+        name = "9:16"
+
+    h, w = res
+    print(f"[Resolution] Auto-detected: {name} ({w}x{h}) for input {orig_w}x{orig_h} (aspect={aspect:.2f})")
+    return h, w
 
 
 def prepare_image(image_b64, target_height=None, target_width=None):
-    """base64 이미지를 PIL Image로 변환하고 지정 해상도로 리사이즈
-
-    CogVideoX1.5-5B-I2V는 커스텀 해상도 지원.
-    target이 None이면 입력 이미지 비율에 맞는 최적 해상도 자동 선택.
-    """
-    # Decode base64
+    """Decode base64 image and resize to target resolution"""
     image_bytes = base64.b64decode(image_b64)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     orig_w, orig_h = image.size
     print(f"[Image] Original size: {orig_w}x{orig_h}")
 
-    # 목표 해상도 결정 (auto 모드: 이미지 비율 기반 자동 선택)
+    # Auto-detect resolution if not specified
     if target_height is None or target_width is None:
         target_height, target_width = detect_best_resolution(orig_w, orig_h)
 
@@ -348,56 +390,40 @@ def prepare_image(image_b64, target_height=None, target_width=None):
 
 
 def resolve_resolution(resolution_str):
-    """해상도 문자열을 (height, width) 튜플로 변환
-
-    CogVideoX1.5-5B-I2V 해상도 규칙 (공식 스펙):
-    - Min(W, H) = 768
-    - 768 <= Max(W, H) <= 1360
-    - Max(W, H) % 16 = 0
-
-    지원 형식:
-    - "auto" 또는 "16:9" → 기본 권장 해상도 (768x1360)
-    - "9:16", "4:3", "3:4", "1:1" → SUPPORTED_RESOLUTIONS에서 조회
-    - "HxW" 형식 (예: "768x1360") → 직접 파싱 + 규칙 검증
-    """
+    """Convert resolution string to (height, width) tuple"""
     if not resolution_str or resolution_str == "auto":
-        return DEFAULT_HEIGHT, DEFAULT_WIDTH
+        return None, None  # Will be auto-detected from image
 
-    # SUPPORTED_RESOLUTIONS에서 조회
+    # Lookup in SUPPORTED_RESOLUTIONS
     if resolution_str in SUPPORTED_RESOLUTIONS:
         return SUPPORTED_RESOLUTIONS[resolution_str]
 
-    # "HxW" 형식 파싱
+    # Parse "HxW" format
     if "x" in resolution_str:
         try:
             parts = resolution_str.lower().split("x")
             h, w = int(parts[0]), int(parts[1])
 
-            # CogVideoX1.5 핵심 제약: height는 반드시 768!
-            # height > 768이면 positional embedding 텐서 크기 불일치 에러 발생
-            if h > 768:
-                print(f"[Resolution] WARNING: height={h} > 768 is not supported! Falling back to 768x768")
-                return 768, 768
+            # Ensure dimensions are multiples of 16
+            h = max((h // 16) * 16, 256)
+            w = max((w // 16) * 16, 256)
 
-            # height를 768로 고정
-            h = 768
-
-            # Width: 768~1360, must be %16=0
-            w = min(max(w, 768), 1360)
-            w = (w // 16) * 16
+            # Cap at reasonable size
+            h = min(h, 1280)
+            w = min(w, 1280)
 
             print(f"[Resolution] Custom: {w}x{h} (validated)")
             return h, w
         except (ValueError, IndexError):
             pass
 
-    # 파싱 실패 시 기본값
-    print(f"[Resolution] Unknown format '{resolution_str}', using default {DEFAULT_HEIGHT}x{DEFAULT_WIDTH}")
+    # Fallback
+    print(f"[Resolution] Unknown format '{resolution_str}', using default {DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
     return DEFAULT_HEIGHT, DEFAULT_WIDTH
 
 
 def handler(job):
-    """RunPod serverless handler - CogVideoX1.5 I2V"""
+    """RunPod serverless handler - Wan2.1-Fun I2V"""
     global pipe
 
     try:
@@ -420,23 +446,24 @@ def handler(job):
         fps = int(job_input.get("fps", 16))
         resolution = job_input.get("resolution", "auto")
 
-        # CogVideoX1.5 프레임 규칙: 16N+1 (N<=10)
-        # 유효값: 17, 33, 49, 65, 81, 97, 113, 129, 145, 161
-        valid_frames = [16 * n + 1 for n in range(1, 11)]
+        # Wan 2.1 frame rule: 4N+1
+        # Valid values: 5, 9, 13, 17, 21, 25, ..., 77, 81, 85
+        valid_frames = [4 * n + 1 for n in range(1, 22)]  # 5 to 85
         if num_frames not in valid_frames:
-            # 가장 가까운 유효값으로 보정
             num_frames = min(valid_frames, key=lambda x: abs(x - num_frames))
-            print(f"[Frames] Adjusted to nearest valid value: {num_frames}")
+            print(f"[Frames] Adjusted to nearest valid value (4N+1): {num_frames}")
 
-        # 해상도 결정 (CogVideoX1.5는 커스텀 해상도 지원)
+        # Resolve resolution
         if resolution == "auto":
-            # auto 모드: prepare_image에서 이미지 비율 기반으로 자동 결정
             image, target_height, target_width = prepare_image(image_b64)
         else:
             target_height, target_width = resolve_resolution(resolution)
-            image, target_height, target_width = prepare_image(image_b64, target_height, target_width)
+            if target_height is None:
+                image, target_height, target_width = prepare_image(image_b64)
+            else:
+                image, target_height, target_width = prepare_image(image_b64, target_height, target_width)
 
-        # Seed (공식: generator는 device 미지정 = CPU)
+        # Seed
         if seed < 0:
             seed = torch.randint(0, 2**31, (1,)).item()
         generator = torch.Generator().manual_seed(seed)
@@ -447,22 +474,19 @@ def handler(job):
             f"resolution={target_width}x{target_height}, fps={fps}"
         )
 
-        # Build pipeline kwargs (공식 cli_demo.py 기준)
-        # CogVideoX1.5-5B-I2V는 height/width 전달 지원
+        # Build pipeline kwargs
         pipe_kwargs = {
             "image": image,
             "prompt": prompt,
-            "height": target_height,
-            "width": target_width,
             "num_frames": num_frames,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
-            "num_videos_per_prompt": 1,
-            "use_dynamic_cfg": True,
             "generator": generator,
+            "height": target_height,
+            "width": target_width,
         }
 
-        # Add negative prompt only if provided
+        # Add negative prompt if provided
         if negative_prompt:
             pipe_kwargs["negative_prompt"] = negative_prompt
 
