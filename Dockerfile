@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir \
     "transformers>=4.44.0" \
     accelerate \
     sentencepiece \
+    tiktoken \
     ftfy \
     "imageio[ffmpeg]" \
     Pillow \
