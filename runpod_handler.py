@@ -38,13 +38,13 @@ SAFETENSORS_MIN_SIZE_MB = 10
 DEFAULT_HEIGHT = 768
 DEFAULT_WIDTH = 1360
 
-# CogVideoX1.5 지원 해상도 (height, width) - I2V는 커스텀 해상도도 지원
+# CogVideoX1.5 지원 해상도 (height, width)
+# ** 중요: height는 반드시 768이어야 함! height > 768이면 positional embedding 텐서 크기 불일치 에러 발생 **
+# 세로(portrait) 영상은 지원 불가 - 세로 이미지는 1:1(정사각형)으로 자동 변환
 SUPPORTED_RESOLUTIONS = {
-    "16:9": (768, 1360),   # 기본 권장
-    "9:16": (1360, 768),   # 세로형
-    "4:3": (768, 1024),    # 4:3
-    "3:4": (1024, 768),    # 세로 4:3
-    "1:1": (768, 768),     # 정사각형
+    "16:9": (768, 1360),   # 기본 권장 (가로형 와이드)
+    "4:3": (768, 1024),    # 가로형 표준
+    "1:1": (768, 768),     # 정사각형 (세로 이미지에 최적)
 }
 
 pipe = None
@@ -298,24 +298,30 @@ def load_model():
 def detect_best_resolution(orig_w, orig_h):
     """입력 이미지의 비율을 감지하여 가장 적합한 CogVideoX1.5 해상도 반환
 
-    CogVideoX1.5 규칙: Min(W,H)=768, 768<=Max(W,H)<=1360, Max(W,H)%16=0
+    CogVideoX1.5 제약: height는 반드시 768이어야 함 (positional embedding 제약)
+    - 가로 이미지 → 16:9(1360x768) 또는 4:3(1024x768)
+    - 정사각형 이미지 → 1:1(768x768)
+    - 세로 이미지 → 1:1(768x768) (세로 해상도는 지원 불가)
     """
     aspect = orig_w / orig_h
 
-    # 각 지원 해상도와 비율 비교하여 가장 가까운 것 선택
-    best_match = None
-    best_diff = float("inf")
-
-    for name, (h, w) in SUPPORTED_RESOLUTIONS.items():
-        res_aspect = w / h
-        diff = abs(aspect - res_aspect)
-        if diff < best_diff:
-            best_diff = diff
-            best_match = (h, w, name)
-
-    h, w, name = best_match
-    print(f"[Resolution] Auto-detected: {name} ({w}x{h}) for input {orig_w}x{orig_h} (aspect={aspect:.2f})")
-    return h, w
+    if aspect < 0.9:
+        # 세로 이미지: 1:1 정사각형이 최선 (height > 768 불가)
+        print(f"[Resolution] Portrait image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 1:1 (768x768)")
+        print(f"[Resolution] Note: CogVideoX1.5 does not support height > 768, using square crop")
+        return 768, 768
+    elif aspect < 1.15:
+        # 거의 정사각형
+        print(f"[Resolution] Square-ish image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 1:1 (768x768)")
+        return 768, 768
+    elif aspect < 1.5:
+        # 4:3 가로
+        print(f"[Resolution] Landscape image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 4:3 (1024x768)")
+        return 768, 1024
+    else:
+        # 16:9 와이드
+        print(f"[Resolution] Wide image ({orig_w}x{orig_h}, aspect={aspect:.2f}) -> 16:9 (1360x768)")
+        return 768, 1360
 
 
 def prepare_image(image_b64, target_height=None, target_width=None):
@@ -367,29 +373,18 @@ def resolve_resolution(resolution_str):
             parts = resolution_str.lower().split("x")
             h, w = int(parts[0]), int(parts[1])
 
-            # CogVideoX1.5 해상도 규칙 적용
-            min_dim = min(h, w)
-            max_dim = max(h, w)
+            # CogVideoX1.5 핵심 제약: height는 반드시 768!
+            # height > 768이면 positional embedding 텐서 크기 불일치 에러 발생
+            if h > 768:
+                print(f"[Resolution] WARNING: height={h} > 768 is not supported! Falling back to 768x768")
+                return 768, 768
 
-            # Min dimension must be 768
-            if min_dim != 768:
-                ratio = 768 / min_dim
-                if h < w:
-                    h = 768
-                    w = int(w * ratio)
-                else:
-                    w = 768
-                    h = int(h * ratio)
+            # height를 768로 고정
+            h = 768
 
-            # Max dimension: 768~1360, must be %16=0
-            max_dim = max(h, w)
-            max_dim = min(max(max_dim, 768), 1360)
-            max_dim = (max_dim // 16) * 16
-
-            if h >= w:
-                h = max_dim
-            else:
-                w = max_dim
+            # Width: 768~1360, must be %16=0
+            w = min(max(w, 768), 1360)
+            w = (w // 16) * 16
 
             print(f"[Resolution] Custom: {w}x{h} (validated)")
             return h, w
