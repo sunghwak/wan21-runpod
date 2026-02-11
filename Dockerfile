@@ -30,10 +30,11 @@ RUN pip3 install --no-cache-dir \
     torch==2.7.1+cu128 \
     --extra-index-url https://download.pytorch.org/whl/cu128
 
-# Diffusers - v0.36.0+ has native Wan2.2 MoE support
+# Diffusers - main branch required for Wan2.2 MoE support
 # (transformer_2, guidance_scale_2, load_into_transformer_2)
+# See: https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers
 RUN pip3 install --no-cache-dir \
-    "diffusers>=0.36.0"
+    "git+https://github.com/huggingface/diffusers"
 
 # ML dependencies
 RUN pip3 install --no-cache-dir \
