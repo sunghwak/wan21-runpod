@@ -328,11 +328,9 @@ def load_model():
         torch_dtype=torch.bfloat16,
     ).to("cuda")
 
-    # Step 3: Load LoRAs (Lightning + NSFW)
-    adapter_names_high = []  # adapters for transformer (high noise)
-    adapter_names_low = []   # adapters for transformer_2 (low noise)
+    # Step 3: Load LoRAs (all loaded as toggleable adapters, not fused)
 
-    # 3a: Lightning LoRA (speed acceleration)
+    # 3a: Lightning LoRA (speed acceleration, toggleable)
     if has_lightning:
         print("[LoRA] Loading Lightning LoRA (high noise)...")
         lora_subpath = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_SUBDIR)
@@ -341,7 +339,6 @@ def load_model():
             weight_name=LIGHTNING_HIGH_NOISE,
             adapter_name="lightning_high",
         )
-        adapter_names_high.append("lightning_high")
 
         print("[LoRA] Loading Lightning LoRA (low noise)...")
         pipe.load_lora_weights(
@@ -350,9 +347,9 @@ def load_model():
             adapter_name="lightning_low",
             load_into_transformer_2=True,
         )
-        adapter_names_low.append("lightning_low")
+        print("[LoRA] Lightning LoRA loaded (toggleable per request)")
 
-    # 3b: NSFW LoRA (content freedom)
+    # 3b: NSFW LoRA (content freedom, toggleable)
     if has_nsfw:
         print("[LoRA] Loading NSFW LoRA (high noise)...")
         pipe.load_lora_weights(
@@ -360,7 +357,6 @@ def load_model():
             weight_name=NSFW_HIGH_NOISE,
             adapter_name="nsfw_high",
         )
-        adapter_names_high.append("nsfw_high")
 
         print("[LoRA] Loading NSFW LoRA (low noise)...")
         pipe.load_lora_weights(
@@ -369,29 +365,17 @@ def load_model():
             adapter_name="nsfw_low",
             load_into_transformer_2=True,
         )
-        adapter_names_low.append("nsfw_low")
+        print("[LoRA] NSFW LoRA loaded (toggleable per request)")
 
-    # 3c: Fuse all LoRAs into model weights (zero overhead at inference)
-    all_adapters = adapter_names_high + adapter_names_low
+    # 3c: Initialize all adapters OFF (will be toggled per request)
+    all_adapters = []
+    if has_lightning:
+        all_adapters.extend(["lightning_high", "lightning_low"])
+    if has_nsfw:
+        all_adapters.extend(["nsfw_high", "nsfw_low"])
     if all_adapters:
-        print(f"[LoRA] Fusing LoRAs: {all_adapters}")
-        all_weights = [1.0] * len(all_adapters)
-        pipe.set_adapters(all_adapters, adapter_weights=all_weights)
-
-        if adapter_names_high:
-            pipe.fuse_lora(
-                adapter_names=adapter_names_high,
-                lora_scale=1.0,
-                components=["transformer"],
-            )
-        if adapter_names_low:
-            pipe.fuse_lora(
-                adapter_names=adapter_names_low,
-                lora_scale=1.0,
-                components=["transformer_2"],
-            )
-        pipe.unload_lora_weights()
-        print(f"[LoRA] All LoRAs fused and unloaded (zero overhead)")
+        pipe.set_adapters(all_adapters, adapter_weights=[0.0] * len(all_adapters))
+        print(f"[LoRA] All adapters initialized OFF: {all_adapters}")
 
     # Step 4: Text encoder quantization - DISABLED
     # torchao is incompatible with torch 2.7.1 and causes diffusers import crash
@@ -449,6 +433,29 @@ def handler(job):
         seed = int(job_input.get("seed", -1))
         fps = int(job_input.get("fps", FIXED_FPS))
         resolution = job_input.get("resolution", "auto")
+        enable_lightning = bool(job_input.get("enable_lightning", True))
+        enable_nsfw = bool(job_input.get("enable_nsfw", False))
+
+        # Toggle LoRAs per request
+        adapters = []
+        weights = []
+        for name, enabled in [
+            ("lightning_high", enable_lightning),
+            ("lightning_low", enable_lightning),
+            ("nsfw_high", enable_nsfw),
+            ("nsfw_low", enable_nsfw),
+        ]:
+            adapters.append(name)
+            weights.append(1.0 if enabled else 0.0)
+        try:
+            pipe.set_adapters(adapters, adapter_weights=weights)
+            active = [a for a, w in zip(adapters, weights) if w > 0]
+            if active:
+                print(f"[LoRA] Active: {active}")
+            else:
+                print("[LoRA] All LoRAs OFF")
+        except Exception as e:
+            print(f"[LoRA] set_adapters skipped: {e}")
 
         # Validate num_frames (clamp to valid range)
         num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
