@@ -1,22 +1,26 @@
 """
-RunPod Serverless Handler - Wan2.1-Fun-V1.3-InP (Image-to-Video)
-VideoX-Fun InPainting-based I2V model (Alibaba PAI)
+RunPod Serverless Handler - Wan2.2-I2V-A14B (Image-to-Video)
+Wan 2.2 MoE I2V model with Lightning LoRA acceleration + optional NSFW LoRA
 
-Model: alibaba-pai/Wan2.1-Fun-V1.3-InP
-Base: Wan 2.1 14B (no safety alignment - uncensored)
+Model: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+Architecture: MoE (Mixture-of-Experts) - dual transformer (high noise + low noise)
+LoRA: lightx2v/Wan2.2-Lightning (4-8 steps acceleration)
 Resolution: Flexible (480x832 default, supports portrait/landscape/square)
 Frames: 81 (5s@16fps)
-VRAM: ~30GB (A100 80GB recommended)
+VRAM: ~56GB active (A100 80GB recommended)
+
+References:
+  - https://github.com/AleefBilal/wan22-I2V-runpod
+  - https://huggingface.co/spaces/obsxrver/Wan2.2-I2V-LoRA-Demo
 """
 
 import os
 import io
-import json
+import gc
 import time
 import base64
 import tempfile
 import traceback
-import shutil
 
 import torch
 import numpy as np
@@ -24,345 +28,110 @@ from PIL import Image
 
 import runpod
 
-# --- Configuration ---
-MODEL_ID = "alibaba-pai/Wan2.1-Fun-V1.3-InP"
-CACHE_DIR = "/runpod-volume/huggingface"
+# ===========================================================================
+# Configuration
+# ===========================================================================
 
-# Cache version: change this to force re-download on Network Volume
-CACHE_VERSION = "wan21-fun-v1.3-inp-v1"
+# Model paths on Network Volume (pre-downloaded)
+MODEL_DIR = "/runpod-volume/models/Wan2.2-I2V-A14B-Diffusers"
+LORA_DIR = "/runpod-volume/models/lora"
 
-# Safetensors minimum size (incomplete downloads are smaller)
-SAFETENSORS_MIN_SIZE_MB = 10
+# Lightning LoRA for speed acceleration (4-8 steps instead of 40-50)
+LIGHTNING_LORA_DIR = os.path.join(LORA_DIR, "Wan2.2-Lightning")
+LIGHTNING_LORA_SUBDIR = "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"
+LIGHTNING_HIGH_NOISE = "high_noise_model.safetensors"
+LIGHTNING_LOW_NOISE = "low_noise_model.safetensors"
 
-# Default resolution (Wan 2.1 standard 720P landscape)
-DEFAULT_HEIGHT = 480
-DEFAULT_WIDTH = 832
+# NSFW LoRA (optional - only loaded if present on disk)
+NSFW_LORA_DIR = os.path.join(LORA_DIR, "nsfw-lora")
 
-# Wan2.1-Fun supports flexible resolutions (height, width)
-# Unlike CogVideoX, portrait is fully supported!
+# Cache version marker
+CACHE_VERSION = "wan22-i2v-a14b-v1"
+
+# Image sizing
+MAX_DIM = 832
+MIN_DIM = 480
+MULTIPLE_OF = 16
+
+# Video defaults
+FIXED_FPS = 16
+MIN_FRAMES = 8
+MAX_FRAMES = 161  # ~10s @ 16fps
+
+# Wan2.2 I2V supports flexible resolutions (height, width)
 SUPPORTED_RESOLUTIONS = {
-    "16:9": (480, 832),     # landscape wide (default, fast)
-    "9:16": (832, 480),     # portrait tall (fast)
-    "4:3": (480, 640),      # landscape standard
-    "3:4": (640, 480),      # portrait standard
-    "1:1": (480, 480),      # square
-    "16:9-HD": (720, 1280), # HD landscape (slower, higher quality)
-    "9:16-HD": (1280, 720), # HD portrait (slower, higher quality)
-    "1:1-HD": (720, 720),   # HD square (slower, higher quality)
+    "16:9": (480, 832),      # landscape wide (default, fast)
+    "9:16": (832, 480),      # portrait tall (fast)
+    "4:3": (480, 640),       # landscape standard
+    "3:4": (640, 480),       # portrait standard
+    "1:1": (480, 480),       # square
+    "16:9-HD": (720, 1280),  # HD landscape (slower, higher quality)
+    "9:16-HD": (1280, 720),  # HD portrait (slower, higher quality)
+    "1:1-HD": (720, 720),    # HD square (slower, higher quality)
 }
 
+DEFAULT_NEGATIVE_PROMPT = (
+    "low quality, worst quality, motion artifacts, unstable motion, jitter, "
+    "frame jitter, wobbling limbs, motion distortion, inconsistent movement, "
+    "robotic movement, animation-like motion, awkward transitions, "
+    "incorrect body mechanics, unnatural posing, off-balance poses, "
+    "frozen frames, duplicated frames, frame skipping, warped motion, "
+    "bad anatomy, incorrect proportions, deformed body, twisted torso, "
+    "broken joints, dislocated limbs, distorted neck, malformed hands, "
+    "extra fingers, missing fingers, fused fingers, extra limbs, "
+    "blurry details, ghosting, compression noise, jpeg artifacts"
+)
+
+# ===========================================================================
+# Global state
+# ===========================================================================
 pipe = None
 gpu_name = "Unknown"
 
 
-def get_cache_marker_path(cache_dir):
-    """Cache version marker file path"""
-    return os.path.join(cache_dir, ".cache_version")
+# ===========================================================================
+# Image utilities
+# ===========================================================================
+def resize_image(image: Image.Image) -> Image.Image:
+    """Resize image to model-compatible dimensions.
 
+    Maintains aspect ratio, clamps to MAX_DIM/MIN_DIM,
+    and ensures dimensions are multiples of MULTIPLE_OF.
+    """
+    w, h = image.size
 
-def needs_force_clean(cache_dir):
-    """Check version marker to determine if force re-download is needed"""
-    marker_path = get_cache_marker_path(cache_dir)
+    # Scale down if larger than MAX_DIM
+    scale = min(MAX_DIM / max(w, h), 1.0)
+    w, h = int(w * scale), int(h * scale)
 
-    if not os.path.exists(marker_path):
-        print(f"[Cache] No version marker found - force clean needed")
-        return True
+    # Snap to multiples of 16
+    w = (w // MULTIPLE_OF) * MULTIPLE_OF
+    h = (h // MULTIPLE_OF) * MULTIPLE_OF
 
-    with open(marker_path, "r") as f:
-        stored_version = f.read().strip()
+    # Enforce minimum
+    w = max(MIN_DIM, w)
+    h = max(MIN_DIM, h)
 
-    if stored_version != CACHE_VERSION:
-        print(f"[Cache] Version mismatch: stored='{stored_version}' vs expected='{CACHE_VERSION}'")
-        return True
-
-    print(f"[Cache] Version marker matches: {CACHE_VERSION}")
-    return False
-
-
-def mark_cache_valid(cache_dir):
-    """Write version marker after successful model load"""
-    marker_path = get_cache_marker_path(cache_dir)
-    with open(marker_path, "w") as f:
-        f.write(CACHE_VERSION)
-    print(f"[Cache] Version marker written: {CACHE_VERSION}")
-
-
-def force_clean_model_cache(cache_dir, model_id):
-    """Completely remove model cache for clean re-download"""
-    model_cache_path = os.path.join(
-        cache_dir, "models--" + model_id.replace("/", "--")
-    )
-
-    if os.path.exists(model_cache_path):
-        total_size = 0
-        file_count = 0
-        for dp, dn, filenames in os.walk(model_cache_path):
-            for f in filenames:
-                total_size += os.path.getsize(os.path.join(dp, f))
-                file_count += 1
-
-        print(f"[Cache] FORCE CLEAN: Removing {file_count} files ({total_size / (1024**3):.2f} GB)")
-        print(f"[Cache] Path: {model_cache_path}")
-        shutil.rmtree(model_cache_path, ignore_errors=True)
-        print(f"[Cache] Removed successfully. Will re-download from HuggingFace.")
-    else:
-        print(f"[Cache] No existing cache to clean at: {model_cache_path}")
-
-    # Also remove version marker
-    marker_path = get_cache_marker_path(cache_dir)
-    if os.path.exists(marker_path):
-        os.remove(marker_path)
-
-
-def validate_cache(cache_dir, model_id):
-    """Validate integrity of cached model files on Network Volume"""
-    if not os.path.exists(cache_dir):
-        print(f"[Cache] Cache directory does not exist: {cache_dir}")
-        return False
-
-    model_cache_path = os.path.join(
-        cache_dir, "models--" + model_id.replace("/", "--")
-    )
-    if not os.path.exists(model_cache_path):
-        print(f"[Cache] No cached model found at: {model_cache_path}")
-        return False
-
-    print(f"[Cache] Validating cache at: {model_cache_path}")
-    corrupted = False
-    safetensors_files = []
-    total_safetensors_size = 0
-
-    for root, dirs, files in os.walk(model_cache_path):
-        for f in files:
-            filepath = os.path.join(root, f)
-
-            # JSON file validation
-            if f.endswith(".json"):
-                try:
-                    with open(filepath, "r") as fh:
-                        json.load(fh)
-                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-                    print(f"[Cache] CORRUPTED JSON: {filepath}")
-                    corrupted = True
-                    break
-
-            # Safetensors validation
-            elif f.endswith(".safetensors"):
-                file_size = os.path.getsize(filepath)
-                file_size_mb = file_size / (1024 * 1024)
-                safetensors_files.append((f, file_size_mb))
-                total_safetensors_size += file_size
-
-                if file_size_mb < SAFETENSORS_MIN_SIZE_MB:
-                    print(f"[Cache] CORRUPTED safetensors (too small: {file_size_mb:.1f}MB): {filepath}")
-                    corrupted = True
-                    break
-
-            # Binary model files
-            elif f.endswith((".model", ".bin")):
-                file_size = os.path.getsize(filepath)
-                if file_size < 1024:
-                    print(f"[Cache] CORRUPTED binary (too small: {file_size}B): {filepath}")
-                    corrupted = True
-                    break
-
-        if corrupted:
-            break
-
-    # Total safetensors size check (Wan 2.1 14B ~ 28GB+ in safetensors)
-    if not corrupted:
-        total_gb = total_safetensors_size / (1024**3)
-        print(f"[Cache] Found {len(safetensors_files)} safetensors files, total: {total_gb:.2f} GB")
-
-        for name, size_mb in safetensors_files:
-            print(f"  - {name}: {size_mb:.1f} MB")
-
-        if total_gb < 5.0:
-            print(f"[Cache] CORRUPTED: Total safetensors size {total_gb:.2f}GB < 5GB minimum!")
-            corrupted = True
-
-    if corrupted:
-        print(f"[Cache] Corrupted cache detected! Removing for clean re-download...")
-        shutil.rmtree(model_cache_path, ignore_errors=True)
-        marker_path = get_cache_marker_path(cache_dir)
-        if os.path.exists(marker_path):
-            os.remove(marker_path)
-        print(f"[Cache] Removed: {model_cache_path}")
-        return False
-    else:
-        print(f"[Cache] All validations passed!")
-        return True
-
-
-def cleanup_old_models(cache_dir, current_model_id):
-    """Remove old model caches to free disk space"""
-    if not os.path.exists(cache_dir):
-        return
-
-    current_cache_name = "models--" + current_model_id.replace("/", "--")
-
-    for item in os.listdir(cache_dir):
-        item_path = os.path.join(cache_dir, item)
-        if item.startswith("models--") and item != current_cache_name and os.path.isdir(item_path):
-            print(f"[Cleanup] Removing old model cache: {item}")
-            shutil.rmtree(item_path, ignore_errors=True)
-            print(f"[Cleanup] Removed: {item}")
-
-    # Clean orphaned temp/lock files
-    for item in os.listdir(cache_dir):
-        item_path = os.path.join(cache_dir, item)
-        if item.endswith(".lock") or item.endswith(".tmp"):
-            try:
-                os.remove(item_path)
-                print(f"[Cleanup] Removed temp file: {item}")
-            except OSError:
-                pass
-
-
-def load_model():
-    """Load Wan2.1-Fun-V1.3-InP model"""
-    global pipe, gpu_name
-
-    if pipe is not None:
-        return
-
-    print(f"[Model] Loading {MODEL_ID}...")
-    print(f"[Model] Cache version: {CACHE_VERSION}")
-    start = time.time()
-
-    # GPU info
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"[Model] GPU: {gpu_name} ({vram_gb:.1f} GB)")
-
-    # Create cache directory
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    # Step 1: Clean up old models (CogVideoX, etc.)
-    cleanup_old_models(CACHE_DIR, MODEL_ID)
-
-    # Step 2: Check version marker → force clean if mismatch
-    if needs_force_clean(CACHE_DIR):
-        print(f"[Cache] === FORCE CLEAN MODE ===")
-        force_clean_model_cache(CACHE_DIR, MODEL_ID)
-    else:
-        validate_cache(CACHE_DIR, MODEL_ID)
-
-    # Step 3: Check disk space
-    disk_stat = shutil.disk_usage(CACHE_DIR)
-    free_gb = disk_stat.free / (1024**3)
-    total_gb = disk_stat.total / (1024**3)
-    print(f"[Disk] Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB")
-    if free_gb < 5.0:
-        print(f"[Disk] WARNING: Low disk space! Model download may fail (need ~37GB).")
-
-    # Step 4: Load pipeline
-    # Try diffusers auto-detect first (works if diffusers has WanFunInpaintPipeline)
-    pipeline_loaded = False
-
-    # Approach 1: Auto-detect from model_index.json
-    try:
-        from diffusers import DiffusionPipeline
-        print(f"[Model] Trying DiffusionPipeline.from_pretrained (auto-detect)...")
-        pipe = DiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            cache_dir=CACHE_DIR,
-        )
-        pipeline_loaded = True
-        print(f"[Model] Loaded via DiffusionPipeline auto-detect: {type(pipe).__name__}")
-    except Exception as e1:
-        print(f"[Model] Auto-detect failed: {e1}")
-
-        # Approach 2: Explicit WanFunInpaintPipeline
-        try:
-            from diffusers import WanFunInpaintPipeline
-            print(f"[Model] Trying WanFunInpaintPipeline explicitly...")
-            pipe = WanFunInpaintPipeline.from_pretrained(
-                MODEL_ID,
-                torch_dtype=torch.bfloat16,
-                cache_dir=CACHE_DIR,
-            )
-            pipeline_loaded = True
-            print(f"[Model] Loaded via WanFunInpaintPipeline")
-        except Exception as e2:
-            print(f"[Model] WanFunInpaintPipeline failed: {e2}")
-
-            # Approach 3: Use VideoX-Fun's pipeline (if installed)
-            try:
-                import sys
-                # Try importing from videox_fun package
-                from videox_fun.pipelines.pipeline_wan_fun_inpaint import WanFunInpaintPipeline as VXPipeline
-                print(f"[Model] Trying VideoX-Fun pipeline...")
-                pipe = VXPipeline.from_pretrained(
-                    MODEL_ID,
-                    torch_dtype=torch.bfloat16,
-                    cache_dir=CACHE_DIR,
-                )
-                pipeline_loaded = True
-                print(f"[Model] Loaded via VideoX-Fun pipeline")
-            except Exception as e3:
-                print(f"[Model] VideoX-Fun pipeline failed: {e3}")
-                raise RuntimeError(
-                    f"Failed to load model with all approaches:\n"
-                    f"  1) DiffusionPipeline: {e1}\n"
-                    f"  2) WanFunInpaintPipeline: {e2}\n"
-                    f"  3) VideoX-Fun: {e3}"
-                )
-
-    # Enable VAE optimizations if available
-    if hasattr(pipe, 'vae') and pipe.vae is not None:
-        if hasattr(pipe.vae, 'enable_tiling'):
-            pipe.vae.enable_tiling()
-            print(f"[Model] VAE tiling enabled")
-        if hasattr(pipe.vae, 'enable_slicing'):
-            pipe.vae.enable_slicing()
-            print(f"[Model] VAE slicing enabled")
-
-    # GPU placement
-    if torch.cuda.is_available():
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        if vram_gb >= 40:
-            pipe.to("cuda")
-            print(f"[Model] Full GPU mode ({vram_gb:.0f}GB VRAM)")
-        else:
-            pipe.enable_model_cpu_offload()
-            print(f"[Model] CPU offload mode ({vram_gb:.0f}GB VRAM)")
-
-    elapsed = time.time() - start
-    print(f"[Model] Loaded in {elapsed:.1f}s")
-
-    # Step 5: Mark cache valid
-    mark_cache_valid(CACHE_DIR)
-    print(f"[Model] Ready for inference!")
+    return image.resize((w, h), Image.Resampling.LANCZOS)
 
 
 def detect_best_resolution(orig_w, orig_h):
-    """Detect best resolution based on input image aspect ratio
-
-    Wan2.1-Fun supports flexible resolutions including portrait!
-    """
+    """Detect best resolution based on input image aspect ratio."""
     aspect = orig_w / orig_h
 
     if aspect > 1.5:
-        # Wide landscape (16:9)
         res = SUPPORTED_RESOLUTIONS["16:9"]
         name = "16:9"
     elif aspect > 1.15:
-        # Standard landscape (4:3)
         res = SUPPORTED_RESOLUTIONS["4:3"]
         name = "4:3"
     elif aspect > 0.85:
-        # Square-ish (1:1)
         res = SUPPORTED_RESOLUTIONS["1:1"]
         name = "1:1"
     elif aspect > 0.65:
-        # Standard portrait (3:4)
         res = SUPPORTED_RESOLUTIONS["3:4"]
         name = "3:4"
     else:
-        # Tall portrait (9:16)
         res = SUPPORTED_RESOLUTIONS["9:16"]
         name = "9:16"
 
@@ -371,15 +140,40 @@ def detect_best_resolution(orig_w, orig_h):
     return h, w
 
 
+def resolve_resolution(resolution_str):
+    """Convert resolution string to (height, width) tuple."""
+    if not resolution_str or resolution_str == "auto":
+        return None, None
+
+    if resolution_str in SUPPORTED_RESOLUTIONS:
+        return SUPPORTED_RESOLUTIONS[resolution_str]
+
+    # Parse "HxW" format
+    if "x" in resolution_str:
+        try:
+            parts = resolution_str.lower().split("x")
+            h, w = int(parts[0]), int(parts[1])
+            h = max((h // MULTIPLE_OF) * MULTIPLE_OF, MIN_DIM)
+            w = max((w // MULTIPLE_OF) * MULTIPLE_OF, MIN_DIM)
+            h = min(h, 1280)
+            w = min(w, 1280)
+            print(f"[Resolution] Custom: {w}x{h} (validated)")
+            return h, w
+        except (ValueError, IndexError):
+            pass
+
+    print(f"[Resolution] Unknown format '{resolution_str}', using auto-detect")
+    return None, None
+
+
 def prepare_image(image_b64, target_height=None, target_width=None):
-    """Decode base64 image and resize to target resolution"""
+    """Decode base64 image and resize to target resolution."""
     image_bytes = base64.b64decode(image_b64)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     orig_w, orig_h = image.size
     print(f"[Image] Original size: {orig_w}x{orig_h}")
 
-    # Auto-detect resolution if not specified
     if target_height is None or target_width is None:
         target_height, target_width = detect_best_resolution(orig_w, orig_h)
 
@@ -389,41 +183,226 @@ def prepare_image(image_b64, target_height=None, target_width=None):
     return image, target_height, target_width
 
 
-def resolve_resolution(resolution_str):
-    """Convert resolution string to (height, width) tuple"""
-    if not resolution_str or resolution_str == "auto":
-        return None, None  # Will be auto-detected from image
-
-    # Lookup in SUPPORTED_RESOLUTIONS
-    if resolution_str in SUPPORTED_RESOLUTIONS:
-        return SUPPORTED_RESOLUTIONS[resolution_str]
-
-    # Parse "HxW" format
-    if "x" in resolution_str:
-        try:
-            parts = resolution_str.lower().split("x")
-            h, w = int(parts[0]), int(parts[1])
-
-            # Ensure dimensions are multiples of 16
-            h = max((h // 16) * 16, 256)
-            w = max((w // 16) * 16, 256)
-
-            # Cap at reasonable size
-            h = min(h, 1280)
-            w = min(w, 1280)
-
-            print(f"[Resolution] Custom: {w}x{h} (validated)")
-            return h, w
-        except (ValueError, IndexError):
-            pass
-
-    # Fallback
-    print(f"[Resolution] Unknown format '{resolution_str}', using default {DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
-    return DEFAULT_HEIGHT, DEFAULT_WIDTH
+# ===========================================================================
+# Cache management (Network Volume)
+# ===========================================================================
+def get_cache_marker_path():
+    """Cache version marker file path."""
+    return os.path.join(os.path.dirname(MODEL_DIR), ".cache_version")
 
 
+def check_cache_version():
+    """Check if cache version matches expected version."""
+    marker_path = get_cache_marker_path()
+    if not os.path.exists(marker_path):
+        return False
+    with open(marker_path, "r") as f:
+        stored = f.read().strip()
+    return stored == CACHE_VERSION
+
+
+def mark_cache_valid():
+    """Write cache version marker after successful model load."""
+    marker_path = get_cache_marker_path()
+    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+    with open(marker_path, "w") as f:
+        f.write(CACHE_VERSION)
+    print(f"[Cache] Version marker written: {CACHE_VERSION}")
+
+
+def verify_model_files():
+    """Verify that model files exist on Network Volume."""
+    required_dirs = ["transformer", "transformer_2", "text_encoder", "vae"]
+
+    if not os.path.exists(MODEL_DIR):
+        print(f"[Model] ERROR: Model directory not found: {MODEL_DIR}")
+        print(f"[Model] Please pre-download the model to the Network Volume.")
+        print(f"[Model] Run: huggingface-cli download Wan-AI/Wan2.2-I2V-A14B-Diffusers --local-dir {MODEL_DIR}")
+        return False
+
+    for subdir in required_dirs:
+        path = os.path.join(MODEL_DIR, subdir)
+        if not os.path.exists(path):
+            print(f"[Model] ERROR: Required directory missing: {path}")
+            return False
+
+    # Check model_index.json
+    index_path = os.path.join(MODEL_DIR, "model_index.json")
+    if not os.path.exists(index_path):
+        print(f"[Model] ERROR: model_index.json not found in {MODEL_DIR}")
+        return False
+
+    print(f"[Model] All required model files verified at {MODEL_DIR}")
+    return True
+
+
+def verify_lora_files():
+    """Verify Lightning LoRA files exist. Returns (has_lightning, has_nsfw)."""
+    has_lightning = False
+    has_nsfw = False
+
+    # Check Lightning LoRA
+    lightning_high = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_SUBDIR, LIGHTNING_HIGH_NOISE)
+    lightning_low = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_SUBDIR, LIGHTNING_LOW_NOISE)
+
+    if os.path.exists(lightning_high) and os.path.exists(lightning_low):
+        has_lightning = True
+        print(f"[LoRA] Lightning LoRA found: {LIGHTNING_LORA_DIR}")
+    else:
+        print(f"[LoRA] WARNING: Lightning LoRA not found at {LIGHTNING_LORA_DIR}")
+        print(f"[LoRA] Will run without acceleration (slower, needs more steps)")
+
+    # Check NSFW LoRA (optional)
+    if os.path.exists(NSFW_LORA_DIR):
+        safetensors = [f for f in os.listdir(NSFW_LORA_DIR) if f.endswith(".safetensors")]
+        if safetensors:
+            has_nsfw = True
+            print(f"[LoRA] NSFW LoRA found: {NSFW_LORA_DIR} ({len(safetensors)} files)")
+        else:
+            print(f"[LoRA] NSFW LoRA directory exists but no .safetensors files found")
+    else:
+        print(f"[LoRA] NSFW LoRA not found (optional, skipping)")
+
+    return has_lightning, has_nsfw
+
+
+# ===========================================================================
+# Model loading
+# ===========================================================================
+def load_model():
+    """Load Wan2.2-I2V-A14B pipeline with LoRAs."""
+    global pipe, gpu_name
+
+    if pipe is not None:
+        return
+
+    print("=" * 60)
+    print("[Model] Loading Wan2.2-I2V-A14B-Diffusers...")
+    print(f"[Model] Cache version: {CACHE_VERSION}")
+    print("=" * 60)
+    start = time.time()
+
+    # GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"[GPU] {gpu_name} ({vram_gb:.1f} GB)")
+    else:
+        raise RuntimeError("CUDA not available! This model requires a GPU.")
+
+    # Step 1: Verify model files
+    if not verify_model_files():
+        raise RuntimeError(
+            f"Model files not found at {MODEL_DIR}. "
+            "Please pre-download the model to the RunPod Network Volume. "
+            "See MIGRATION_PLAN.md for instructions."
+        )
+
+    has_lightning, has_nsfw = verify_lora_files()
+
+    # Step 2: Load pipeline with MoE dual transformers
+    from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+    from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
+
+    print("[Model] Loading transformer (high noise expert)...")
+    transformer = WanTransformer3DModel.from_pretrained(
+        MODEL_DIR,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+    )
+
+    print("[Model] Loading transformer_2 (low noise expert)...")
+    transformer_2 = WanTransformer3DModel.from_pretrained(
+        MODEL_DIR,
+        subfolder="transformer_2",
+        torch_dtype=torch.bfloat16,
+    )
+
+    print("[Model] Loading full pipeline...")
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        MODEL_DIR,
+        transformer=transformer,
+        transformer_2=transformer_2,
+        torch_dtype=torch.bfloat16,
+    ).to("cuda")
+
+    # Step 3: Load Lightning LoRA (speed acceleration)
+    if has_lightning:
+        print("[LoRA] Loading Lightning LoRA (high noise)...")
+        lora_subpath = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_SUBDIR)
+        pipe.load_lora_weights(
+            lora_subpath,
+            weight_name=LIGHTNING_HIGH_NOISE,
+            adapter_name="lightning_high",
+        )
+
+        print("[LoRA] Loading Lightning LoRA (low noise)...")
+        pipe.load_lora_weights(
+            lora_subpath,
+            weight_name=LIGHTNING_LOW_NOISE,
+            adapter_name="lightning_low",
+            load_into_transformer_2=True,
+        )
+
+        # Fuse LoRAs for faster inference (no overhead at generation time)
+        print("[LoRA] Fusing Lightning LoRA into model weights...")
+        pipe.set_adapters(
+            ["lightning_high", "lightning_low"],
+            adapter_weights=[1.0, 1.0],
+        )
+        pipe.fuse_lora(
+            adapter_names=["lightning_high"],
+            lora_scale=1.0,
+            components=["transformer"],
+        )
+        pipe.fuse_lora(
+            adapter_names=["lightning_low"],
+            lora_scale=1.0,
+            components=["transformer_2"],
+        )
+        pipe.unload_lora_weights()
+        print("[LoRA] Lightning LoRA fused and unloaded (zero overhead)")
+
+    # Step 4: Text encoder quantization (save VRAM)
+    try:
+        from torchao.quantization import quantize_, Int8WeightOnlyConfig
+        print("[Quantize] Applying Int8 quantization to text encoder...")
+        quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
+        print("[Quantize] Text encoder quantized to Int8")
+    except ImportError:
+        print("[Quantize] torchao not available, skipping text encoder quantization")
+    except Exception as e:
+        print(f"[Quantize] Text encoder quantization failed (non-fatal): {e}")
+
+    # Step 5: VAE optimizations
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        if hasattr(pipe.vae, 'enable_tiling'):
+            pipe.vae.enable_tiling()
+            print("[VAE] Tiling enabled")
+        if hasattr(pipe.vae, 'enable_slicing'):
+            pipe.vae.enable_slicing()
+            print("[VAE] Slicing enabled")
+
+    # Step 6: Ensure bfloat16 precision on transformers
+    pipe.transformer.to(torch.bfloat16)
+    pipe.transformer_2.to(torch.bfloat16)
+
+    elapsed = time.time() - start
+    print("=" * 60)
+    print(f"[Model] Loaded in {elapsed:.1f}s")
+    print(f"[Model] Lightning LoRA: {'enabled' if has_lightning else 'disabled'}")
+    print(f"[Model] Ready for inference!")
+    print("=" * 60)
+
+    # Mark cache valid
+    mark_cache_valid()
+
+
+# ===========================================================================
+# RunPod handler
+# ===========================================================================
 def handler(job):
-    """RunPod serverless handler - Wan2.1-Fun I2V"""
+    """RunPod serverless handler - Wan2.2 I2V."""
     global pipe
 
     try:
@@ -438,17 +417,19 @@ def handler(job):
             return {"error": "image_base64 is required"}
 
         prompt = job_input.get("prompt", "")
-        negative_prompt = job_input.get("negative_prompt", "")
+        negative_prompt = job_input.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
         num_frames = int(job_input.get("num_frames", 81))
-        num_inference_steps = int(job_input.get("num_inference_steps", 50))
-        guidance_scale = float(job_input.get("guidance_scale", 6.0))
+        num_inference_steps = int(job_input.get("num_inference_steps", 6))
+        guidance_scale = float(job_input.get("guidance_scale", 1.0))
+        guidance_scale_2 = float(job_input.get("guidance_scale_2", 1.0))
         seed = int(job_input.get("seed", -1))
-        fps = int(job_input.get("fps", 16))
+        fps = int(job_input.get("fps", FIXED_FPS))
         resolution = job_input.get("resolution", "auto")
 
-        # Wan 2.1 frame rule: 4N+1
-        # Valid values: 5, 9, 13, 17, 21, 25, ..., 77, 81, 85
-        valid_frames = [4 * n + 1 for n in range(1, 22)]  # 5 to 85
+        # Validate num_frames (clamp to valid range)
+        num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
+        # Wan 2.2 frame rule: 4N+1
+        valid_frames = [4 * n + 1 for n in range(1, 41)]  # 5 to 161
         if num_frames not in valid_frames:
             num_frames = min(valid_frames, key=lambda x: abs(x - num_frames))
             print(f"[Frames] Adjusted to nearest valid value (4N+1): {num_frames}")
@@ -461,40 +442,41 @@ def handler(job):
             if target_height is None:
                 image, target_height, target_width = prepare_image(image_b64)
             else:
-                image, target_height, target_width = prepare_image(image_b64, target_height, target_width)
+                image, target_height, target_width = prepare_image(
+                    image_b64, target_height, target_width
+                )
 
         # Seed
         if seed < 0:
             seed = torch.randint(0, 2**31, (1,)).item()
-        generator = torch.Generator().manual_seed(seed)
+        generator = torch.Generator(device="cuda").manual_seed(seed)
 
         print(
-            f"[Generate] prompt='{prompt[:80]}', frames={num_frames}, "
-            f"steps={num_inference_steps}, guidance={guidance_scale}, seed={seed}, "
-            f"resolution={target_width}x{target_height}, fps={fps}"
+            f"[Generate] prompt='{prompt[:80]}...', frames={num_frames}, "
+            f"steps={num_inference_steps}, guidance={guidance_scale}/{guidance_scale_2}, "
+            f"seed={seed}, resolution={target_width}x{target_height}, fps={fps}"
         )
 
-        # Build pipeline kwargs
-        pipe_kwargs = {
-            "image": image,
-            "prompt": prompt,
-            "num_frames": num_frames,
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": guidance_scale,
-            "generator": generator,
-            "height": target_height,
-            "width": target_width,
-        }
-
-        # Add negative prompt if provided
-        if negative_prompt:
-            pipe_kwargs["negative_prompt"] = negative_prompt
+        # Clear GPU cache before generation
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Generate video
         start_time = time.time()
 
         with torch.no_grad():
-            output = pipe(**pipe_kwargs)
+            output = pipe(
+                image=image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=target_height,
+                width=target_width,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                guidance_scale_2=guidance_scale_2,
+                generator=generator,
+            )
 
         generation_time = time.time() - start_time
         print(f"[Generate] Done in {generation_time:.1f}s")
@@ -511,8 +493,10 @@ def handler(job):
         with open(tmp_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # Cleanup temp file
+        # Cleanup
         os.unlink(tmp_path)
+        del output
+        torch.cuda.empty_cache()
 
         return {
             "video_base64": video_b64,
@@ -521,13 +505,20 @@ def handler(job):
             "num_frames": num_frames,
             "resolution": f"{target_width}x{target_height}",
             "gpu_name": gpu_name,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "guidance_scale_2": guidance_scale_2,
         }
 
     except Exception as e:
         traceback.print_exc()
+        torch.cuda.empty_cache()
         return {"error": str(e)}
 
 
-# Start RunPod serverless
+# ===========================================================================
+# Entry point
+# ===========================================================================
+print("[Startup] Wan2.2-I2V-A14B RunPod Handler starting...")
 load_model()
 runpod.serverless.start({"handler": handler})

@@ -1,46 +1,61 @@
-# Wan2.1-Fun-V1.3-InP - RunPod Serverless Docker Image
-# Model: alibaba-pai/Wan2.1-Fun-V1.3-InP (~37GB)
-# VideoX-Fun InPainting-based I2V (Wan 2.1 14B, uncensored)
-# Base: python:3.11-slim
+# Wan2.2-I2V-A14B - RunPod Serverless Docker Image
+# Model: Wan-AI/Wan2.2-I2V-A14B-Diffusers (~126GB, pre-downloaded on Network Volume)
+# MoE I2V with Lightning LoRA acceleration
+# Base: nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
-FROM python:3.11-slim
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV HF_HOME=/runpod-volume/huggingface
 ENV PYTHONUNBUFFERED=1
+# Model is loaded from Network Volume, not HF cache
+ENV HF_HOME=/runpod-volume/huggingface
 
 WORKDIR /app
 
 # System dependencies (ffmpeg for video encoding, git for pip installs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    build-essential \
     ffmpeg \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CUDA 12.1) - torchvision/torchaudio excluded to save ~1.5GB
-RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cu121
+# Upgrade pip
+RUN pip3 install --upgrade pip setuptools wheel
+
+# PyTorch (CUDA 12.8)
+RUN pip3 install --no-cache-dir \
+    torch==2.7.1+cu128 \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+# Diffusers fork with Wan2.2 MoE LoRA support
+# This fork has WanImageToVideoPipeline with transformer_2 + load_into_transformer_2
+RUN pip3 install --no-cache-dir \
+    "git+https://github.com/linoytsaban/diffusers.git@wan22-loras"
 
 # ML dependencies
-# - diffusers >= 0.34.0: WanFunInpaintPipeline support
-# - transformers >= 4.46.0: Wan 2.1 model support
-# - sentencepiece: T5 text encoder tokenizer
-# - accelerate: model loading acceleration
-RUN pip install --no-cache-dir \
-    "diffusers>=0.34.0" \
+RUN pip3 install --no-cache-dir \
     "transformers>=4.46.0" \
-    accelerate \
+    "accelerate>=1.0.0" \
+    "peft>=0.15.0" \
+    "safetensors>=0.4.0" \
     sentencepiece \
     ftfy \
     "imageio[ffmpeg]" \
     Pillow \
-    numpy \
+    numpy
+
+# Quantization support (text encoder Int8)
+RUN pip3 install --no-cache-dir \
+    torchao
+
+# RunPod SDK
+RUN pip3 install --no-cache-dir \
     runpod
 
-# Install VideoX-Fun package (provides WanFunInpaintPipeline if not in diffusers)
-RUN pip install --no-cache-dir "git+https://github.com/aigc-apps/VideoX-Fun.git" || \
-    echo "VideoX-Fun install failed (optional, diffusers may have built-in support)"
-
+# Copy handler
 COPY runpod_handler.py /app/
 
-CMD ["python", "-u", "runpod_handler.py"]
+CMD ["python3", "-u", "runpod_handler.py"]
