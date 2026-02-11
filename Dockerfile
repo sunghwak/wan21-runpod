@@ -30,10 +30,10 @@ RUN pip3 install --no-cache-dir \
     torch==2.7.1+cu128 \
     --extra-index-url https://download.pytorch.org/whl/cu128
 
-# Diffusers fork with Wan2.2 MoE LoRA support
-# This fork has WanImageToVideoPipeline with transformer_2 + load_into_transformer_2
+# Diffusers - v0.36.0+ has native Wan2.2 MoE support
+# (transformer_2, guidance_scale_2, load_into_transformer_2)
 RUN pip3 install --no-cache-dir \
-    "git+https://github.com/linoytsaban/diffusers.git@wan22-loras"
+    "diffusers>=0.36.0"
 
 # ML dependencies
 RUN pip3 install --no-cache-dir \

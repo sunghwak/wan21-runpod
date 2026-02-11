@@ -301,8 +301,7 @@ def load_model():
     has_lightning, has_nsfw = verify_lora_files()
 
     # Step 2: Load pipeline with MoE dual transformers
-    from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
-    from diffusers.models.transformers.transformer_wan import WanTransformer3DModel
+    from diffusers import WanImageToVideoPipeline, WanTransformer3DModel
 
     print("[Model] Loading transformer (high noise expert)...")
     transformer = WanTransformer3DModel.from_pretrained(
