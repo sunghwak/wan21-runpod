@@ -44,6 +44,8 @@ LIGHTNING_LOW_NOISE = "low_noise_model.safetensors"
 
 # NSFW LoRA (optional - only loaded if present on disk)
 NSFW_LORA_DIR = os.path.join(LORA_DIR, "nsfw-lora")
+NSFW_HIGH_NOISE = "NSFW-22-H-e8.safetensors"
+NSFW_LOW_NOISE = "NSFW-22-L-e8.safetensors"
 
 # Cache version marker
 CACHE_VERSION = "wan22-i2v-a14b-v1"
@@ -253,13 +255,14 @@ def verify_lora_files():
         print(f"[LoRA] Will run without acceleration (slower, needs more steps)")
 
     # Check NSFW LoRA (optional)
-    if os.path.exists(NSFW_LORA_DIR):
-        safetensors = [f for f in os.listdir(NSFW_LORA_DIR) if f.endswith(".safetensors")]
-        if safetensors:
-            has_nsfw = True
-            print(f"[LoRA] NSFW LoRA found: {NSFW_LORA_DIR} ({len(safetensors)} files)")
-        else:
-            print(f"[LoRA] NSFW LoRA directory exists but no .safetensors files found")
+    nsfw_high = os.path.join(NSFW_LORA_DIR, NSFW_HIGH_NOISE)
+    nsfw_low = os.path.join(NSFW_LORA_DIR, NSFW_LOW_NOISE)
+
+    if os.path.exists(nsfw_high) and os.path.exists(nsfw_low):
+        has_nsfw = True
+        print(f"[LoRA] NSFW LoRA found: {NSFW_LORA_DIR}")
+        print(f"[LoRA]   High: {NSFW_HIGH_NOISE}")
+        print(f"[LoRA]   Low:  {NSFW_LOW_NOISE}")
     else:
         print(f"[LoRA] NSFW LoRA not found (optional, skipping)")
 
@@ -325,7 +328,11 @@ def load_model():
         torch_dtype=torch.bfloat16,
     ).to("cuda")
 
-    # Step 3: Load Lightning LoRA (speed acceleration)
+    # Step 3: Load LoRAs (Lightning + NSFW)
+    adapter_names_high = []  # adapters for transformer (high noise)
+    adapter_names_low = []   # adapters for transformer_2 (low noise)
+
+    # 3a: Lightning LoRA (speed acceleration)
     if has_lightning:
         print("[LoRA] Loading Lightning LoRA (high noise)...")
         lora_subpath = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_SUBDIR)
@@ -334,6 +341,7 @@ def load_model():
             weight_name=LIGHTNING_HIGH_NOISE,
             adapter_name="lightning_high",
         )
+        adapter_names_high.append("lightning_high")
 
         print("[LoRA] Loading Lightning LoRA (low noise)...")
         pipe.load_lora_weights(
@@ -342,25 +350,48 @@ def load_model():
             adapter_name="lightning_low",
             load_into_transformer_2=True,
         )
+        adapter_names_low.append("lightning_low")
 
-        # Fuse LoRAs for faster inference (no overhead at generation time)
-        print("[LoRA] Fusing Lightning LoRA into model weights...")
-        pipe.set_adapters(
-            ["lightning_high", "lightning_low"],
-            adapter_weights=[1.0, 1.0],
+    # 3b: NSFW LoRA (content freedom)
+    if has_nsfw:
+        print("[LoRA] Loading NSFW LoRA (high noise)...")
+        pipe.load_lora_weights(
+            NSFW_LORA_DIR,
+            weight_name=NSFW_HIGH_NOISE,
+            adapter_name="nsfw_high",
         )
-        pipe.fuse_lora(
-            adapter_names=["lightning_high"],
-            lora_scale=1.0,
-            components=["transformer"],
+        adapter_names_high.append("nsfw_high")
+
+        print("[LoRA] Loading NSFW LoRA (low noise)...")
+        pipe.load_lora_weights(
+            NSFW_LORA_DIR,
+            weight_name=NSFW_LOW_NOISE,
+            adapter_name="nsfw_low",
+            load_into_transformer_2=True,
         )
-        pipe.fuse_lora(
-            adapter_names=["lightning_low"],
-            lora_scale=1.0,
-            components=["transformer_2"],
-        )
+        adapter_names_low.append("nsfw_low")
+
+    # 3c: Fuse all LoRAs into model weights (zero overhead at inference)
+    all_adapters = adapter_names_high + adapter_names_low
+    if all_adapters:
+        print(f"[LoRA] Fusing LoRAs: {all_adapters}")
+        all_weights = [1.0] * len(all_adapters)
+        pipe.set_adapters(all_adapters, adapter_weights=all_weights)
+
+        if adapter_names_high:
+            pipe.fuse_lora(
+                adapter_names=adapter_names_high,
+                lora_scale=1.0,
+                components=["transformer"],
+            )
+        if adapter_names_low:
+            pipe.fuse_lora(
+                adapter_names=adapter_names_low,
+                lora_scale=1.0,
+                components=["transformer_2"],
+            )
         pipe.unload_lora_weights()
-        print("[LoRA] Lightning LoRA fused and unloaded (zero overhead)")
+        print(f"[LoRA] All LoRAs fused and unloaded (zero overhead)")
 
     # Step 4: Text encoder quantization - DISABLED
     # torchao is incompatible with torch 2.7.1 and causes diffusers import crash
