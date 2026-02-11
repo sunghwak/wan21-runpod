@@ -47,9 +47,8 @@ RUN pip3 install --no-cache-dir \
     Pillow \
     numpy
 
-# Quantization support (text encoder Int8)
-RUN pip3 install --no-cache-dir \
-    torchao
+# NOTE: torchao removed - incompatible with torch 2.7.1 (causes diffusers import crash)
+# 80GB VRAM is sufficient without text encoder quantization
 
 # RunPod SDK
 RUN pip3 install --no-cache-dir \

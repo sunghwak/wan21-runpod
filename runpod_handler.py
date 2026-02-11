@@ -363,16 +363,10 @@ def load_model():
         pipe.unload_lora_weights()
         print("[LoRA] Lightning LoRA fused and unloaded (zero overhead)")
 
-    # Step 4: Text encoder quantization (save VRAM)
-    try:
-        from torchao.quantization import quantize_, Int8WeightOnlyConfig
-        print("[Quantize] Applying Int8 quantization to text encoder...")
-        quantize_(pipe.text_encoder, Int8WeightOnlyConfig())
-        print("[Quantize] Text encoder quantized to Int8")
-    except ImportError:
-        print("[Quantize] torchao not available, skipping text encoder quantization")
-    except Exception as e:
-        print(f"[Quantize] Text encoder quantization failed (non-fatal): {e}")
+    # Step 4: Text encoder quantization - DISABLED
+    # torchao is incompatible with torch 2.7.1 and causes diffusers import crash
+    # 80GB VRAM is sufficient without quantization
+    print("[Quantize] Skipped (80GB VRAM sufficient without quantization)")
 
     # Step 5: VAE optimizations
     if hasattr(pipe, 'vae') and pipe.vae is not None:
